@@ -398,7 +398,7 @@ installed by another shell integration path or manually added to the SSH cache.
 
 #### Persistent command shortcuts
 
-The PowerShell integration includes a persistent command shortcuts prototype:
+The PowerShell integration includes persistent command shortcuts:
 
 - **CLI usage**: `shortcut add [--project|-p] [--force|-f] <name> <command>`,
   `shortcut list [--project|-p]`, `shortcut remove [--project|-p] <name>`, and
@@ -411,21 +411,40 @@ The PowerShell integration includes a persistent command shortcuts prototype:
   and its subdirectories via a `.git` directory or `.git` worktree/submodule
   file, and erroring outside a Git working tree). Project shortcuts override
   global shortcuts dynamically as you `cd`.
-- **Execution & quoting**: Shortcuts execute in the current PowerShell session
-  and directory, preserve internal quotes verbatim, forward extra arguments,
-  preserve `$LASTEXITCODE` (for native commands and OSC 133 D), record
-  non-terminating `Write-Error`s in `$Error`, propagate terminating errors
-  (`throw`, setting `$?` to `$false`), and guard against recursion (max depth 8).
+- **Execution & scope**: Shortcuts execute in the caller's own PowerShell
+  scope (ordinary variable assignments and function definitions persist in the
+  prompt or enclosing function without leaking to `Global:` or shadowing user
+  variables such as `$Command`, `$sb`, `$depth`, or `$cmdOk`), preserve internal
+  quotes verbatim, forward extra arguments, and forward pipeline input
+  (`0`/`1`/`N` objects, non-string objects, and native stdin via AST-checked
+  `GetSteppablePipeline` when piped, leaving non-piped commands untouched).
+  They preserve `$?`, `$LASTEXITCODE`, PowerShell 7 `&&`/`||`, non-terminating
+  `Write-Error`, `throw`, and OSC 133 D without duplicating errors or polluting
+  `$Error` on success, and enforce a recursion limit of 8.
 - **Collision rule**: PowerShell resolves its own commands, functions, aliases,
   cmdlets, and `PATH` applications first. `shortcut add` blocks colliding names
   unless `--force` (`-f`) is passed, which warns and saves anyway.
-- **Storage & performance**: Shortcuts are stored in `shortcuts.json`, resolved
+- **Storage & concurrency**: Shortcuts are stored in `shortcuts.json`, resolved
   in order from `NOCTTY_SHORTCUTS_PATH`, `$env:XDG_CONFIG_HOME\noctty\shortcuts.json`,
-  `shortcuts.json` beside `noctty.portable`, or `%LOCALAPPDATA%\noctty\shortcuts.json`.
-  The store is lazy-loaded with zero startup I/O, cached by path, mtime, and
-  size, and written atomically. Resolution hooks `CommandNotFoundAction` (in
-  `FullLanguage` mode, chaining any existing handler) with no keystroke
+  portable `shortcuts.json` beside `noctty.portable`, or
+  `%LOCALAPPDATA%\noctty\shortcuts.json`. The store is lazy-loaded with zero
+  startup I/O and cached by path, mtime, and size. Mutations run inside an
+  exclusive cross-process `<store>.lock` transaction
+  (`__ghostty_mutate_shortcuts`) that reloads bypassing cache, applies only the
+  requested change, and commits atomically via `File.Replace` with
+  `[NullString]::Value` (no non-atomic `File.Copy` fallback; corrupt or
+  non-object JSON and lock timeouts fail without wiping the store or publishing
+  uncommitted cache state). Hashtable accesses use unambiguous
+  `.get_Keys()`/`.get_Count()`/`.get_Item()`/`.set_Item()` so shortcut names
+  like `keys`, `count`, or `values` work safely. Resolution hooks
+  `CommandNotFoundAction` (chaining any existing handler) with no keystroke
   interception, no per-prompt Git lookup, and no polling.
+- **Real engine boundaries**: Requires `FullLanguage` mode (skipped gracefully
+  under `ConstrainedLanguage`). Caller-scope and `$?` propagation rely on
+  lazy-cached reflection of `SessionStateInternal.CurrentScope` and
+  `PipelineProcessor.ExecutionFailed` initialized only on first shortcut
+  invocation (zero startup cost). `ConvertFrom-Json` itself reserves the
+  literal member name `psobject`.
 
 Interactive `cmd.exe` launches are auto-integrated by wrapping the inherited
 `PROMPT` (or cmd's `$P$G` default) with OSC 133 A/B prompt marks and OSC 9;9 cwd
