@@ -910,8 +910,8 @@ test "integration.ps1 honours the injected block scope" {
     }
     // Guard the guard: if either scan stops matching, everything above turns
     // vacuous. These are the live counts; bump them when the script grows.
-    try std.testing.expectEqual(@as(usize, 24), declarations);
-    try std.testing.expectEqual(@as(usize, 11), top_level_variables);
+    try std.testing.expectEqual(@as(usize, 36), declarations);
+    try std.testing.expectEqual(@as(usize, 13), top_level_variables);
     // Unbalanced braces here mean the tracker desynced (an unterminated
     // string, a here-string, nesting past the stack), which would silently
     // mis-classify every line after it.
@@ -970,11 +970,23 @@ test "integration.ps1 honours the injected block scope" {
         "__ghostty_ssh_wrapper_is_ours",
         "__ghostty_install_alias",
         "__ghostty_retire_legacy_hooks",
+        "__ghostty_shortcuts_path",
+        "__ghostty_normalize_project_root",
+        "__ghostty_find_git_root",
+        "__ghostty_load_shortcuts",
+        "__ghostty_save_shortcuts",
+        "__ghostty_shortcut_lookup",
+        "__ghostty_escape_single_quote",
+        "__ghostty_run_shortcut",
+        "__ghostty_install_shortcut_hook",
+        "__ghostty_shortcut_cli_exists",
+        "__ghostty_shortcut_cli_is_ours",
     }) |name| {
         var buf: [96]u8 = undefined;
         const decl = try std.fmt.bufPrint(&buf, "\nfunction global:{s} {{", .{name});
         try std.testing.expect(std.mem.indexOf(u8, integration_script, decl) != null);
     }
+    try std.testing.expect(codeContains("function global:shortcut {"));
 }
 
 /// Does `integration.ps1` contain `needle` in CODE, ignoring whole-line `#`
@@ -1777,8 +1789,8 @@ test "integration.ps1 changes only with its revision" {
     // to the revision and SHA-256 it now has, which puts the question of
     // whether to bump in front of the author and the reviewer; it cannot judge
     // whether the change needed one.
-    const pinned_revision: u32 = 1;
-    const pinned_sha256 = "328192524f590570ff521cd52043a6c016c86627fab3848951eea1317571d14b";
+    const pinned_revision: u32 = 2;
+    const pinned_sha256 = "7db8b62432d50317bc1d05690c5f0419ed18ed76105ce38c22f57e324038d208";
     const hex = std.fmt.bytesToHex(integration_script_sha256, .lower);
     try std.testing.expectEqual(@as(?u32, pinned_revision), scriptRevision(integration_script));
     try std.testing.expectEqualStrings(pinned_sha256, &hex);
@@ -2120,4 +2132,26 @@ test "PowerShell marks: a prompt that stays unwrapped gets no D from the line re
         defer alloc.free(output);
         try std.testing.expectEqualStrings("LOCKED> ", output);
     }
+}
+
+test "integration.ps1 hooks shortcuts via CommandNotFoundAction with zero prompt or startup overhead" {
+    try std.testing.expect(codeContains("__ghostty_install_shortcut_hook"));
+    try std.testing.expect(codeContains("$ExecutionContext.InvokeCommand.CommandNotFoundAction = {"));
+    try std.testing.expect(codeContains("$CommandLookupEventArgs.CommandOrigin -eq [System.Management.Automation.CommandOrigin]::Runspace"));
+    try std.testing.expect(codeContains("__ghostty_shortcut_checking"));
+    try std.testing.expect(codeContains("__ghostty_shortcut_in_lookup"));
+    try std.testing.expect(codeContains("__ghostty_shortcut_depth"));
+    try std.testing.expect(codeContains("__ghostty_run_shortcut"));
+    try std.testing.expect(codeContains("__ghostty_shortcut_cli_marker"));
+    try std.testing.expect(codeContains("__ghostty_shortcut_cli_exists"));
+    try std.testing.expect(!codeContains("Get-Command -Name 'shortcut'"));
+    try std.testing.expect(!codeContains(".GetNewClosure()"));
+    try std.testing.expect(!codeContains("-AddToHistoryHandler {"));
+
+    // Prompt and readline paths must not perform Git root discovery per prompt.
+    const prompt_body = std.mem.indexOf(u8, integration_script, "function global:__ghostty_prompt_body {").?;
+    const readline_fn = std.mem.indexOf(u8, integration_script, "function global:__ghostty_readline {").?;
+    const shortcuts_sec = std.mem.indexOf(u8, integration_script, "function global:__ghostty_shortcuts_path {").?;
+    try std.testing.expect(std.mem.indexOf(u8, integration_script[prompt_body..shortcuts_sec], "__ghostty_find_git_root") == null);
+    try std.testing.expect(std.mem.indexOf(u8, integration_script[readline_fn..shortcuts_sec], "__ghostty_find_git_root") == null);
 }

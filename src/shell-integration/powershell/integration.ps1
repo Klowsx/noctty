@@ -1,6 +1,6 @@
 # Noctty shell integration for PowerShell 5.1+ / pwsh 7+
 # Emits OSC 133 (command marking) and OSC 7 (current working directory) sequences.
-# noctty-integration-revision: 1
+# noctty-integration-revision: 2
 #   Raise it when a change must not be undone by an older noctty that shares
 #   the installed copy; see src/apprt/win32_powershell_install.zig.
 #
@@ -1107,3 +1107,520 @@ function global:__ghostty_install_alias {
 __ghostty_retire_legacy_hooks
 __ghostty_wrap_prompt -EvenIfMissing
 __ghostty_install_alias 'PSConsoleHostReadLine' '__ghostty_readline'
+
+# ── Persistent command shortcuts ─────────────────────────────────────────
+# Lazy-loaded JSON store for global and per-Git-repo command shortcuts.
+# Startup performs zero file I/O; shortcuts.json is read on first `shortcut`
+# call or first CommandNotFoundAction miss, and cached by mtime + length.
+
+function global:__ghostty_shortcuts_path {
+    if (-not [string]::IsNullOrWhiteSpace($env:NOCTTY_SHORTCUTS_PATH)) {
+        return $env:NOCTTY_SHORTCUTS_PATH
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:XDG_CONFIG_HOME)) {
+        return (Join-Path $env:XDG_CONFIG_HOME 'noctty\shortcuts.json')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:GHOSTTY_BIN_DIR) -and
+        (Test-Path -LiteralPath (Join-Path $env:GHOSTTY_BIN_DIR 'noctty.portable') -PathType Leaf)) {
+        return (Join-Path $env:GHOSTTY_BIN_DIR 'shortcuts.json')
+    }
+    $localAppData = $env:LOCALAPPDATA
+    if ([string]::IsNullOrWhiteSpace($localAppData)) {
+        $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+    }
+    return (Join-Path $localAppData 'noctty\shortcuts.json')
+}
+
+function global:__ghostty_normalize_project_root {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $trimmed = $full.TrimEnd('\', '/')
+    if ($trimmed.Length -eq 2 -and $trimmed[1] -eq ':') {
+        return ($trimmed + '\')
+    }
+    if ([string]::IsNullOrEmpty($trimmed)) { return $full }
+    return $trimmed
+}
+
+function global:__ghostty_find_git_root {
+    if ($PWD.Provider.Name -ne 'FileSystem') { return $null }
+    $path = $PWD.ProviderPath
+    if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+    $normalized = __ghostty_normalize_project_root $path
+    if ([string]::IsNullOrEmpty($normalized)) { return $null }
+    $dir = [System.IO.DirectoryInfo]::new($normalized)
+    $probe = $dir
+    while ($null -ne $probe) {
+        if ($probe.Name -ieq '.git') { return $null }
+        $probe = $probe.Parent
+    }
+    $cur = $dir
+    while ($null -ne $cur) {
+        $gitPath = [System.IO.Path]::Combine($cur.FullName, '.git')
+        if ([System.IO.Directory]::Exists($gitPath) -or [System.IO.File]::Exists($gitPath)) {
+            return (__ghostty_normalize_project_root $cur.FullName)
+        }
+        $cur = $cur.Parent
+    }
+    return $null
+}
+
+function global:__ghostty_load_shortcuts {
+    param([switch]$IgnoreReadError)
+    $path = __ghostty_shortcuts_path
+    $exists = $false
+    $ticks = [long]0
+    $length = [long]0
+    if ([System.IO.File]::Exists($path)) {
+        $info = [System.IO.FileInfo]::new($path)
+        $exists = $true
+        $ticks = $info.LastWriteTimeUtc.Ticks
+        $length = $info.Length
+    }
+    $cache = __ghostty_read_global '__ghostty_shortcut_cache'
+    if ($null -ne $cache -and
+        $cache.Path -ceq $path -and
+        $cache.Exists -eq $exists -and
+        $cache.Ticks -eq $ticks -and
+        $cache.Length -eq $length) {
+        return $cache
+    }
+
+    $globalMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $projectsMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    if ($exists) {
+        try {
+            $raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                $parsed = $raw | ConvertFrom-Json
+                if ($null -ne $parsed) {
+                    $globalProp = $parsed.PSObject.Properties['global']
+                    if ($null -ne $globalProp -and $null -ne $globalProp.Value) {
+                        foreach ($entry in $globalProp.Value.PSObject.Properties) {
+                            $globalMap[$entry.Name] = [string]$entry.Value
+                        }
+                    }
+                    $projectsProp = $parsed.PSObject.Properties['projects']
+                    if ($null -ne $projectsProp -and $null -ne $projectsProp.Value) {
+                        foreach ($projEntry in $projectsProp.Value.PSObject.Properties) {
+                            $projKey = __ghostty_normalize_project_root $projEntry.Name
+                            if (-not [string]::IsNullOrEmpty($projKey) -and $null -ne $projEntry.Value) {
+                                $projCmds = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+                                foreach ($cmdEntry in $projEntry.Value.PSObject.Properties) {
+                                    $projCmds[$cmdEntry.Name] = [string]$cmdEntry.Value
+                                }
+                                $projectsMap[$projKey] = $projCmds
+                            }
+                        }
+                    }
+                }
+            }
+        } catch {
+            if (-not $IgnoreReadError) { throw }
+            return $null
+        }
+    }
+
+    $loaded = [pscustomobject]@{
+        Path = $path
+        Exists = $exists
+        Ticks = $ticks
+        Length = $length
+        Global = $globalMap
+        Projects = $projectsMap
+    }
+    $Global:__ghostty_shortcut_cache = $loaded
+    return $loaded
+}
+
+function global:__ghostty_save_shortcuts {
+    param($Data)
+    $path = $Data.Path
+    $dir = [System.IO.Path]::GetDirectoryName($path)
+    if (-not [string]::IsNullOrEmpty($dir) -and -not [System.IO.Directory]::Exists($dir)) {
+        [void][System.IO.Directory]::CreateDirectory($dir)
+    }
+    $payload = [ordered]@{
+        version = 1
+        global = $Data.Global
+        projects = $Data.Projects
+    }
+    $json = $payload | ConvertTo-Json -Depth 5
+    $tmpName = '.' + [System.IO.Path]::GetFileName($path) + '.' + [guid]::NewGuid().ToString('n') + '.tmp'
+    $tmpPath = if ([string]::IsNullOrEmpty($dir)) { $tmpName } else { [System.IO.Path]::Combine($dir, $tmpName) }
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($tmpPath, $json, $utf8NoBom)
+    try {
+        if ([System.IO.File]::Exists($path)) {
+            [System.IO.File]::Replace($tmpPath, $path, $null)
+        } else {
+            [System.IO.File]::Move($tmpPath, $path)
+        }
+    } catch {
+        try {
+            [System.IO.File]::Copy($tmpPath, $path, $true)
+            [System.IO.File]::Delete($tmpPath)
+        } catch {
+            if ([System.IO.File]::Exists($tmpPath)) {
+                try { [System.IO.File]::Delete($tmpPath) } catch {}
+            }
+            throw
+        }
+    }
+    $info = [System.IO.FileInfo]::new($path)
+    $Data.Exists = $true
+    $Data.Ticks = $info.LastWriteTimeUtc.Ticks
+    $Data.Length = $info.Length
+    $Global:__ghostty_shortcut_cache = $Data
+}
+
+function global:__ghostty_escape_single_quote {
+    param([string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) { return '' }
+    $escaped = $Value.Replace("'", "''")
+    foreach ($cp in @(0x2018, 0x2019, 0x201A, 0x201B)) {
+        $q = [string][char]$cp
+        $escaped = $escaped.Replace($q, $q + $q)
+    }
+    return $escaped
+}
+
+function global:__ghostty_run_shortcut {
+    if ($args.Count -eq 0) { return }
+    $Command = [string]$args[0]
+    [object[]]$__ghostty_shortcut_args = @()
+    if ($args.Count -gt 1) {
+        $__ghostty_shortcut_args = @($args[1..($args.Count - 1)])
+    }
+    $depth = [int](__ghostty_read_global '__ghostty_shortcut_depth')
+    if ($depth -ge 8) {
+        throw "noctty shortcut recursion limit (8) exceeded while invoking '$Command'."
+    }
+    $Global:__ghostty_shortcut_depth = $depth + 1
+    $cmdOk = $true
+    try {
+        if ($__ghostty_shortcut_args.Count -eq 0) {
+            $sb = [scriptblock]::Create($Command)
+            . $sb
+            $cmdOk = $?
+        } else {
+            $withArgs = $Command + ' @__ghostty_shortcut_args'
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseInput($withArgs, [ref]$null, [ref]$parseErrors)
+            if ($parseErrors.Count -eq 0) {
+                $sb = [scriptblock]::Create($withArgs)
+                . $sb
+                $cmdOk = $?
+            } else {
+                $sb = [scriptblock]::Create($Command)
+                . $sb @__ghostty_shortcut_args
+                $cmdOk = $?
+            }
+        }
+    } finally {
+        $Global:__ghostty_shortcut_depth = $depth
+    }
+    if (-not $cmdOk) {
+        Microsoft.PowerShell.Utility\Write-Error -Message '' -ErrorAction Ignore
+    }
+}
+
+function global:__ghostty_shortcut_lookup {
+    param($Sender, $CommandLookupEventArgs)
+    if ($null -eq $CommandLookupEventArgs) { return }
+    if (__ghostty_read_global '__ghostty_shortcut_in_lookup') { return }
+    $name = $CommandLookupEventArgs.CommandName
+    if (-not (__ghostty_read_global '__ghostty_shortcut_checking') -and
+        (($CommandLookupEventArgs.CommandOrigin -eq [System.Management.Automation.CommandOrigin]::Runspace) -or
+         ([int](__ghostty_read_global '__ghostty_shortcut_depth') -gt 0)) -and
+        -not [string]::IsNullOrWhiteSpace($name) -and
+        -not ($name -match '[\s/\\:\*\?\[\];\|&<>''"]') -and
+        ($name -ine 'shortcut')) {
+        $matched = $null
+        try {
+            $data = __ghostty_load_shortcuts -IgnoreReadError
+            if ($null -ne $data -and ($data.Projects.Count -gt 0 -or $data.Global.Count -gt 0)) {
+                if ($data.Projects.Count -gt 0) {
+                    $projectRoot = __ghostty_find_git_root
+                    if ($null -ne $projectRoot -and $data.Projects.ContainsKey($projectRoot)) {
+                        $projMap = $data.Projects[$projectRoot]
+                        if ($projMap.ContainsKey($name)) {
+                            $matched = $projMap[$name]
+                        }
+                    }
+                }
+                if ($null -eq $matched -and $data.Global.ContainsKey($name)) {
+                    $matched = $data.Global[$name]
+                }
+            }
+        } catch {
+            $matched = $null
+        }
+        if ($null -ne $matched) {
+            $escapedCmd = __ghostty_escape_single_quote $matched
+            $CommandLookupEventArgs.CommandScriptBlock = [scriptblock]::Create("__ghostty_run_shortcut '$escapedCmd' @args")
+            $CommandLookupEventArgs.StopSearch = $true
+            return
+        }
+    }
+    $prev = __ghostty_read_global '__ghostty_shortcut_prev_handler'
+    if ($null -ne $prev) {
+        if ($name -match '[\s/\\:\*\?\[\];\|&<>''"]') {
+            $prev.Invoke($Sender, $CommandLookupEventArgs)
+        } else {
+            $Global:__ghostty_shortcut_in_lookup = $true
+            try {
+                $prev.Invoke($Sender, $CommandLookupEventArgs)
+            } finally {
+                $Global:__ghostty_shortcut_in_lookup = $false
+            }
+        }
+    }
+}
+
+function global:__ghostty_install_shortcut_hook {
+    if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { return }
+    try {
+        $current = $ExecutionContext.InvokeCommand.CommandNotFoundAction
+        $ours = __ghostty_read_global '__ghostty_shortcut_handler'
+        if ($null -ne $current -and $null -ne $ours -and (__ghostty_same_object $current $ours)) {
+            return
+        }
+        if ($null -ne $current -and $null -ne $current.Target -and ([string]$current.Target).Contains('__ghostty_shortcut_lookup')) {
+            $Global:__ghostty_shortcut_handler = $current
+            return
+        }
+        $Global:__ghostty_shortcut_prev_handler = $current
+        $ExecutionContext.InvokeCommand.CommandNotFoundAction = {
+            param($Sender, $CommandLookupEventArgs)
+            __ghostty_shortcut_lookup $Sender $CommandLookupEventArgs
+        }
+        $Global:__ghostty_shortcut_handler = $ExecutionContext.InvokeCommand.CommandNotFoundAction
+    } catch {
+        # Keep shell startup clean if the host forbids CommandNotFoundAction.
+    }
+}
+
+function global:__ghostty_shortcut_cli_exists {
+    return (($null -ne ${function:global:shortcut}) -or ($null -ne ${alias:shortcut}))
+}
+
+function global:__ghostty_shortcut_cli_is_ours {
+    if (-not (__ghostty_read_global '__ghostty_shortcut_cli_installed')) { return $false }
+    $existing = ${function:global:shortcut}
+    if ($null -eq $existing) { return $false }
+    return ([string]$existing).Contains('__ghostty_shortcut_cli_marker')
+}
+
+if (__ghostty_shortcut_cli_is_ours) {
+    Remove-Item -LiteralPath 'Function:\shortcut' -Force -ErrorAction Ignore -Confirm:$false -WhatIf:$false
+    $Global:__ghostty_shortcut_cli_installed = $false
+}
+
+if (__ghostty_shortcut_cli_exists) {
+    Write-Warning 'noctty PowerShell shortcut CLI skipped: a profile function or alias owns shortcut.' -WarningAction Continue
+} else {
+    function global:shortcut {
+        # __ghostty_shortcut_cli_marker
+        [string[]]$rawArgs = @($args | ForEach-Object { [string]$_ })
+        if ($rawArgs.Count -eq 0 -or $rawArgs[0] -ieq 'help' -or $rawArgs[0] -ieq '--help' -or $rawArgs[0] -ieq '-h') {
+            Write-Output 'Usage:'
+            Write-Output '  shortcut add [--project|-p] [--force|-f] <name> <command>'
+            Write-Output '  shortcut list [--project|-p]'
+            Write-Output '  shortcut remove [--project|-p] <name>'
+            Write-Output '  shortcut help'
+            return
+        }
+
+        $sub = $rawArgs[0].ToLowerInvariant()
+        [string[]]$rest = @()
+        if ($rawArgs.Count -gt 1) {
+            $rest = @($rawArgs[1..($rawArgs.Count - 1)])
+        }
+
+        if ($sub -eq 'add') {
+            $useProject = $false
+            $force = $false
+            $posStart = $rest.Count
+            for ($i = 0; $i -lt $rest.Count; $i++) {
+                $tok = $rest[$i]
+                if ($tok -eq '--') {
+                    $posStart = $i + 1
+                    break
+                }
+                if ($tok -eq '--project' -or $tok -eq '-p') {
+                    $useProject = $true
+                    continue
+                }
+                if ($tok -eq '--force' -or $tok -eq '-f') {
+                    $force = $true
+                    continue
+                }
+                if ($tok.StartsWith('-')) {
+                    Write-Error "Unknown option '$tok' for 'shortcut add'."
+                    return
+                }
+                $posStart = $i
+                break
+            }
+            if (($rest.Count - $posStart) -lt 2) {
+                Write-Error 'Usage: shortcut add [--project|-p] [--force|-f] <name> <command>'
+                return
+            }
+            $name = $rest[$posStart]
+            if ([string]::IsNullOrWhiteSpace($name) -or ($name -match '[\s/\\:\*\?\[\];\|&<>''"]') -or ($name -ieq 'shortcut')) {
+                Write-Error "Invalid shortcut name '$name'. Names must be non-empty, cannot contain whitespace or PowerShell metacharacters, and cannot be 'shortcut'."
+                return
+            }
+            if (($rest.Count - $posStart) -eq 2) {
+                $cmd = $rest[$posStart + 1]
+            } else {
+                $cmd = ($rest[($posStart + 1)..($rest.Count - 1)] -join ' ')
+            }
+            if ([string]::IsNullOrWhiteSpace($cmd)) {
+                Write-Error 'Shortcut command cannot be empty.'
+                return
+            }
+            $projectRoot = $null
+            if ($useProject) {
+                $projectRoot = __ghostty_find_git_root
+                if ($null -eq $projectRoot) {
+                    Write-Error "Not inside a Git repository. '--project' requires a Git working tree."
+                    return
+                }
+            }
+            $existing = $null
+            $Global:__ghostty_shortcut_checking = $true
+            try {
+                $existing = Get-Command -Name $name -ErrorAction Ignore | Select-Object -First 1
+            } finally {
+                $Global:__ghostty_shortcut_checking = $false
+            }
+            if ($null -ne $existing) {
+                $kind = "$($existing.CommandType)"
+                if (-not $force) {
+                    Write-Error "Cannot register shortcut '$name': name is already occupied by $kind '$($existing.Name)'. Pass --force to save anyway."
+                    return
+                }
+                Write-Warning "Shortcut '$name' collides with existing $kind '$($existing.Name)'; PowerShell will still resolve the existing command first." -WarningAction Continue
+            }
+            $data = __ghostty_load_shortcuts
+            if ($useProject) {
+                if (-not $data.Projects.ContainsKey($projectRoot)) {
+                    $data.Projects[$projectRoot] = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+                }
+                $data.Projects[$projectRoot][$name] = $cmd
+                __ghostty_save_shortcuts $data
+                Write-Output "Saved project shortcut '$name' -> $cmd ($projectRoot)"
+            } else {
+                $data.Global[$name] = $cmd
+                __ghostty_save_shortcuts $data
+                Write-Output "Saved global shortcut '$name' -> $cmd"
+            }
+            return
+        }
+
+        if ($sub -eq 'list') {
+            $useProject = $false
+            foreach ($tok in $rest) {
+                if ($tok -eq '--project' -or $tok -eq '-p') {
+                    $useProject = $true
+                } else {
+                    Write-Error "Unknown argument '$tok' for 'shortcut list'."
+                    return
+                }
+            }
+            $projectRoot = $null
+            if ($useProject) {
+                $projectRoot = __ghostty_find_git_root
+                if ($null -eq $projectRoot) {
+                    Write-Error "Not inside a Git repository. '--project' requires a Git working tree."
+                    return
+                }
+            }
+            $data = __ghostty_load_shortcuts
+            if ($useProject) {
+                if (-not $data.Projects.ContainsKey($projectRoot) -or $data.Projects[$projectRoot].Count -eq 0) {
+                    Write-Output "No project shortcuts for $projectRoot."
+                    return
+                }
+                $map = $data.Projects[$projectRoot]
+            } else {
+                if ($data.Global.Count -eq 0) {
+                    Write-Output 'No global shortcuts.'
+                    return
+                }
+                $map = $data.Global
+            }
+            foreach ($k in ($map.Keys | Sort-Object)) {
+                Write-Output "$k -> $($map[$k])"
+            }
+            return
+        }
+
+        if ($sub -eq 'remove') {
+            $useProject = $false
+            $posStart = $rest.Count
+            for ($i = 0; $i -lt $rest.Count; $i++) {
+                $tok = $rest[$i]
+                if ($tok -eq '--') {
+                    $posStart = $i + 1
+                    break
+                }
+                if ($tok -eq '--project' -or $tok -eq '-p') {
+                    $useProject = $true
+                    continue
+                }
+                if ($tok.StartsWith('-')) {
+                    Write-Error "Unknown option '$tok' for 'shortcut remove'."
+                    return
+                }
+                $posStart = $i
+                break
+            }
+            if (($rest.Count - $posStart) -ne 1) {
+                Write-Error 'Usage: shortcut remove [--project|-p] <name>'
+                return
+            }
+            $name = $rest[$posStart]
+            $projectRoot = $null
+            if ($useProject) {
+                $projectRoot = __ghostty_find_git_root
+                if ($null -eq $projectRoot) {
+                    Write-Error "Not inside a Git repository. '--project' requires a Git working tree."
+                    return
+                }
+            }
+            $data = __ghostty_load_shortcuts
+            if ($useProject) {
+                if (-not $data.Projects.ContainsKey($projectRoot) -or -not $data.Projects[$projectRoot].ContainsKey($name)) {
+                    Write-Error "Shortcut '$name' not found in project '$projectRoot'."
+                    return
+                }
+                $data.Projects[$projectRoot].Remove($name)
+                if ($data.Projects[$projectRoot].Count -eq 0) {
+                    $data.Projects.Remove($projectRoot)
+                }
+                __ghostty_save_shortcuts $data
+                Write-Output "Removed project shortcut '$name' ($projectRoot)."
+            } else {
+                if (-not $data.Global.ContainsKey($name)) {
+                    Write-Error "Shortcut '$name' not found in global shortcuts."
+                    return
+                }
+                $data.Global.Remove($name)
+                __ghostty_save_shortcuts $data
+                Write-Output "Removed global shortcut '$name'."
+            }
+            return
+        }
+
+        Write-Error "Unknown subcommand '$sub'. Run 'shortcut --help' for usage."
+    }
+
+    $Global:__ghostty_shortcut_cli_installed = $true
+}
+
+__ghostty_install_shortcut_hook
