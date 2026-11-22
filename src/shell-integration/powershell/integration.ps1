@@ -1434,43 +1434,112 @@ function global:__ghostty_escape_single_quote {
     return $escaped
 }
 
-function global:__ghostty_run_shortcut {
-    if ($args.Count -eq 0) { return }
-    $Command = [string]$args[0]
-    [object[]]$__ghostty_shortcut_args = @()
-    if ($args.Count -gt 1) {
-        $__ghostty_shortcut_args = @($args[1..($args.Count - 1)])
+function global:__ghostty_shortcut_reflect {
+    $cached = __ghostty_read_global '__ghostty_shortcut_reflect_cache'
+    if ($null -ne $cached) { return $cached }
+    $flags = [System.Reflection.BindingFlags]'Instance,NonPublic,Public'
+    $ctxField = $ExecutionContext.GetType().GetField('_context', $flags)
+    $ctxSample = $ctxField.GetValue($ExecutionContext)
+    $currentCmdProp = $ctxSample.GetType().GetProperty('CurrentCommandProcessor', $flags)
+    $cpSample = $currentCmdProp.GetValue($ctxSample)
+    $cmdRuntimeProp = $cpSample.GetType().GetProperty('CommandRuntime', $flags)
+    $rtSample = $cmdRuntimeProp.GetValue($cpSample)
+    $pipelineProcProp = $rtSample.GetType().GetProperty('PipelineProcessor', $flags)
+    $ppSample = $pipelineProcProp.GetValue($rtSample)
+    $execFailedProp = $ppSample.GetType().GetProperty('ExecutionFailed', $flags)
+    $ssInternalProp = $ExecutionContext.SessionState.GetType().GetProperty('Internal', $flags)
+    $ssIntSample = $ssInternalProp.GetValue($ExecutionContext.SessionState)
+    $currentScopeProp = $ssIntSample.GetType().GetProperty('CurrentScope', $flags)
+    $origScopeSample = $currentScopeProp.GetValue($ssIntSample)
+    $parentScopeProp = $origScopeSample.GetType().GetProperty('Parent', $flags)
+    $Global:__ghostty_shortcut_reflect_cache = @{
+        Flags = $flags
+        ContextField = $ctxField
+        CurrentCmdProp = $currentCmdProp
+        CmdRuntimeProp = $cmdRuntimeProp
+        PipelineProcProp = $pipelineProcProp
+        ExecFailedProp = $execFailedProp
+        SessionInternalProp = $ssInternalProp
+        CurrentScopeProp = $currentScopeProp
+        ParentScopeProp = $parentScopeProp
     }
-    $depth = [int](__ghostty_read_global '__ghostty_shortcut_depth')
-    if ($depth -ge 8) {
-        throw "noctty shortcut recursion limit (8) exceeded while invoking '$Command'."
+    $stackVar = Get-Variable -Name '__ghostty_shortcut_stack' -Scope Global -ErrorAction Ignore
+    if ($null -eq $stackVar -or $null -eq $stackVar.Value) {
+        $Global:__ghostty_shortcut_stack = [System.Collections.Generic.Stack[object]]::new()
     }
-    $Global:__ghostty_shortcut_depth = $depth + 1
-    $cmdOk = $true
-    try {
-        if ($__ghostty_shortcut_args.Count -eq 0) {
-            $sb = [scriptblock]::Create($Command)
-            . $sb
-            $cmdOk = $?
-        } else {
-            $withArgs = $Command + ' @__ghostty_shortcut_args'
-            $parseErrors = $null
-            [void][System.Management.Automation.Language.Parser]::ParseInput($withArgs, [ref]$null, [ref]$parseErrors)
-            if ($parseErrors.Count -eq 0) {
-                $sb = [scriptblock]::Create($withArgs)
-                . $sb
-                $cmdOk = $?
-            } else {
-                $sb = [scriptblock]::Create($Command)
-                . $sb @__ghostty_shortcut_args
-                $cmdOk = $?
-            }
+    return $Global:__ghostty_shortcut_reflect_cache
+}
+
+function global:__ghostty_shortcut_prepare {
+    param(
+        $PipelineProcessor,
+        $SessionInternal,
+        $OrigScope,
+        [bool]$ExpectingInput,
+        $InputEnumerator,
+        [AllowNull()][AllowEmptyCollection()][object[]]$InvokeArgs = @(),
+        [string]$CommandText,
+        [string]$Name
+    )
+    $stack = $Global:__ghostty_shortcut_stack
+    if ($stack.Count -ge 8) {
+        throw "noctty shortcut recursion limit (8) exceeded while invoking '$Name'."
+    }
+    $withArgs = $CommandText + ' @Global:__ghostty_shortcut_args'
+    $parseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($withArgs, [ref]$null, [ref]$parseErrors)
+    $canSplat = ($parseErrors.Count -eq 0)
+
+    $prevArgsVar = Get-Variable -Name '__ghostty_shortcut_args' -Scope Global -ErrorAction Ignore
+    $prevArgs = if ($null -ne $prevArgsVar) { $prevArgsVar.Value } else { $null }
+    $Global:__ghostty_shortcut_args = @($InvokeArgs)
+
+    $passArgsToDot = ($InvokeArgs.Count -gt 0 -and -not $canSplat)
+    $execCmd = if ($canSplat -and $InvokeArgs.Count -gt 0) { $withArgs } else { $CommandText }
+    $useSp = $false
+    if ($ExpectingInput) {
+        $sb = [scriptblock]::Create($execCmd)
+        $ast = $sb.Ast
+        if ($null -eq $ast.BeginBlock -and $null -eq $ast.ProcessBlock -and $null -eq $ast.DynamicParamBlock -and
+            $null -ne $ast.EndBlock -and $ast.EndBlock.Statements.Count -eq 1 -and
+            $ast.EndBlock.Statements[0] -is [System.Management.Automation.Language.PipelineAst] -and
+            $ast.EndBlock.Statements[0].PipelineElements.Count -ge 1 -and
+            $ast.EndBlock.Statements[0].PipelineElements[0] -is [System.Management.Automation.Language.CommandAst]) {
+            $useSp = $true
         }
-    } finally {
-        $Global:__ghostty_shortcut_depth = $depth
+    } else {
+        $sb = [scriptblock]::Create($execCmd + "`n" + '$Global:__ghostty_shortcut_stack.Peek().Ok = $?')
     }
-    if (-not $cmdOk) {
-        Microsoft.PowerShell.Utility\Write-Error -Message '' -ErrorAction Ignore
+
+    $stack.Push(@{
+        PP = $PipelineProcessor
+        SsInt = $SessionInternal
+        OrigScope = $OrigScope
+        PrevArgs = $prevArgs
+        Exp = $ExpectingInput
+        In = $InputEnumerator
+        Sb = $sb
+        UseSp = $useSp
+        Sp = $null
+        PassArgsToDot = $passArgsToDot
+        Ok = $true
+    })
+    $Global:__ghostty_shortcut_depth = $stack.Count
+}
+
+function global:__ghostty_shortcut_exit {
+    $stackVar = Get-Variable -Name '__ghostty_shortcut_stack' -Scope Global -ErrorAction Ignore
+    if ($null -eq $stackVar -or $null -eq $stackVar.Value) { return }
+    $stack = $stackVar.Value
+    if ($stack.Count -eq 0) { return }
+    $frame = $stack.Pop()
+    $Global:__ghostty_shortcut_depth = $stack.Count
+    $Global:__ghostty_shortcut_args = $frame.PrevArgs
+    if ($null -ne $frame.Sp) {
+        try { $frame.Sp.Dispose() } catch {}
+    }
+    if (-not $frame.Ok -and $null -ne $frame.PP) {
+        $Global:__ghostty_shortcut_reflect_cache.ExecFailedProp.SetValue($frame.PP, $true)
     }
 }
 
@@ -1507,7 +1576,30 @@ function global:__ghostty_shortcut_lookup {
         }
         if ($null -ne $matched) {
             $escapedCmd = __ghostty_escape_single_quote $matched
-            $CommandLookupEventArgs.CommandScriptBlock = [scriptblock]::Create("__ghostty_run_shortcut '$escapedCmd' @args")
+            $escapedName = __ghostty_escape_single_quote $name
+            $body = '$__r = __ghostty_shortcut_reflect; ' +
+                '$__ss = $__r.SessionInternalProp.GetValue($ExecutionContext.SessionState); ' +
+                '$__os = $__r.CurrentScopeProp.GetValue($__ss); ' +
+                '$__ps = $__r.ParentScopeProp.GetValue($__os); ' +
+                '$__pp = $__r.PipelineProcProp.GetValue($__r.CmdRuntimeProp.GetValue($__r.CurrentCmdProp.GetValue($__r.ContextField.GetValue($ExecutionContext)))); ' +
+                "__ghostty_shortcut_prepare `$__pp `$__ss `$__os `$MyInvocation.ExpectingInput `$input `$args '$escapedCmd' '$escapedName'; " +
+                '$__r.CurrentScopeProp.SetValue($__ss, $__ps); ' +
+                'try { if ($Global:__ghostty_shortcut_stack.Peek().Exp) { ' +
+                'if ($Global:__ghostty_shortcut_stack.Peek().UseSp) { ' +
+                '$Global:__ghostty_shortcut_stack.Peek().Sp = $Global:__ghostty_shortcut_stack.Peek().Sb.GetSteppablePipeline([System.Management.Automation.CommandOrigin]::Internal); ' +
+                '$Global:__ghostty_shortcut_stack.Peek().Sp.Begin($true); ' +
+                'while ($Global:__ghostty_shortcut_stack.Peek().In.MoveNext()) { $Global:__ghostty_shortcut_stack.Peek().Sp.Process($Global:__ghostty_shortcut_stack.Peek().In.Current) }; ' +
+                '$Global:__ghostty_shortcut_stack.Peek().Sp.End(); ' +
+                '$Global:__ghostty_shortcut_stack.Peek().Ok = $? ' +
+                '} else { ' +
+                'if ($Global:__ghostty_shortcut_stack.Peek().PassArgsToDot) { $Global:__ghostty_shortcut_stack.Peek().In | . $Global:__ghostty_shortcut_stack.Peek().Sb @Global:__ghostty_shortcut_args } else { $Global:__ghostty_shortcut_stack.Peek().In | . $Global:__ghostty_shortcut_stack.Peek().Sb }; ' +
+                '$Global:__ghostty_shortcut_stack.Peek().Ok = $? ' +
+                '} } else { ' +
+                'if ($Global:__ghostty_shortcut_stack.Peek().PassArgsToDot) { . $Global:__ghostty_shortcut_stack.Peek().Sb @Global:__ghostty_shortcut_args } else { . $Global:__ghostty_shortcut_stack.Peek().Sb } ' +
+                '} } catch { $Global:__ghostty_shortcut_stack.Peek().Ok = $false; throw } finally { ' +
+                '$Global:__ghostty_shortcut_reflect_cache.CurrentScopeProp.SetValue($Global:__ghostty_shortcut_stack.Peek().SsInt, $Global:__ghostty_shortcut_stack.Peek().OrigScope); ' +
+                '__ghostty_shortcut_exit }'
+            $CommandLookupEventArgs.CommandScriptBlock = [scriptblock]::Create($body)
             $CommandLookupEventArgs.StopSearch = $true
             return
         }

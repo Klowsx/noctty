@@ -89,9 +89,13 @@ try {
             [string]$Postamble = '',
             [string]$WorkingDirectory = $script:TempDir,
             [string]$ShortcutsPath = '',
-            [switch]$WithoutPSReadLine
+            [switch]$WithoutPSReadLine,
+            [switch]$StandInReader
         )
-        $prefix = if ($WithoutPSReadLine) {
+        $prefix = if ($StandInReader) {
+            'Remove-Module PSReadLine -Force -ErrorAction Ignore; ' +
+            'function global:PSConsoleHostReadLine { [Console]::In.ReadLine() }; '
+        } elseif ($WithoutPSReadLine) {
             'Remove-Module PSReadLine -Force -ErrorAction Ignore; '
         } else { '' }
         $childQuotedPath = ConvertTo-PowerShellLiteralContent $script:IntegrationPath
@@ -134,11 +138,12 @@ try {
             [string]$WorkingDirectory = $script:TempDir,
             [string]$ShortcutsPath = '',
             [switch]$WithoutPSReadLine,
+            [switch]$StandInReader,
             [ValidateRange(1, 30000)][int]$TimeoutMs = 30000
         )
 
         $info = New-InjectedChildStartInfo -CaseName $CaseName -Preamble $Preamble -Postamble $Postamble `
-            -WorkingDirectory $WorkingDirectory -ShortcutsPath $ShortcutsPath -WithoutPSReadLine:$WithoutPSReadLine
+            -WorkingDirectory $WorkingDirectory -ShortcutsPath $ShortcutsPath -WithoutPSReadLine:$WithoutPSReadLine -StandInReader:$StandInReader
 
         $parentInputEncoding = [Console]::InputEncoding
         try {
@@ -858,6 +863,157 @@ try {
     Assert-True ($cColl.Stdout.Contains('PUPD_count=p-count-updated')) "Finding 5: project update of 'count' failed: $($cColl.Combined)"
     Assert-True ($cColl.Stdout.Contains("GLIST_AFTER=normal_sc -> Write-Output 'normal-ok'")) "Finding 5: global list after removes unexpected: $($cColl.Combined)"
     Assert-True ($cColl.Stdout.Contains("PLIST_AFTER=normal_sc -> Write-Output 'pnormal-ok'")) "Finding 5: project list after removes unexpected: $($cColl.Combined)"
+
+    # ── Finding 1 regressions: Exit status ($?, $LASTEXITCODE, &&/||, Write-Error, throw, raw flags, OSC 133 D) ──
+    $f1Store = Join-Path $script:TempDir 'finding1\shortcuts.json'
+    $f1Lines = [System.Collections.Generic.List[string]]::new()
+    $f1Lines.Add('$Error.Clear()')
+    $f1Lines.Add('shortcut add rev_exit "cmd.exe /d /c exit 7"')
+    $f1Lines.Add('shortcut add rev_ok "Write-Output ''OK''"')
+    $f1Lines.Add('shortcut add rev_fail "Write-Error ''expected'' -ErrorAction Continue"')
+    $f1Lines.Add('shortcut add rev_throw "throw ''boom''"')
+    $f1Lines.Add('function global:__noctty_flag_echo { $args -join "|" }')
+    $f1Lines.Add('shortcut add rev_echo "__noctty_flag_echo"')
+    $f1Lines.Add('rev_exit')
+    $f1Lines.Add('"F1_EXIT1=$LASTEXITCODE;OK1=$($?)"')
+    $f1Lines.Add('rev_exit')
+    $f1Lines.Add('"F1_EXIT2=$LASTEXITCODE;OK2=$($?)"')
+    $f1Lines.Add('$Error.Clear()')
+    $f1Lines.Add('rev_ok')
+    $f1Lines.Add('"F1_OK_AFTER=$($?);ERR=$($Error.Count)"')
+    $f1Lines.Add('$Error.Clear()')
+    $f1Lines.Add('rev_fail 2>$null')
+    $f1Lines.Add('"F1_WE_NULL=$($?);ERR=$($Error.Count)"')
+    $f1Lines.Add('$Error.Clear()')
+    $f1Lines.Add('$weCap = rev_fail 2>&1')
+    $f1Lines.Add('"F1_WE_CAP=$($?);ERR=$($Error.Count);CAP=$(@($weCap).Count);MSG=$(@($weCap)[0].Exception.Message)"')
+    $f1Lines.Add('$Error.Clear()')
+    $f1Lines.Add('try { rev_throw; "F1_THROW_" + "NOT_CAUGHT" } catch { "F1_THROW_CAUGHT=$($_.Exception.Message)" }')
+    $f1Lines.Add('rev_throw; "F1_THROW_" + "NOT_REACHED"')
+    $f1Lines.Add('"F1_THROW_OK=$($?);MSG=$($Error[0].Exception.Message)"')
+    $f1Lines.Add('$flagsOut = rev_echo -v --host -Command -ErrorAction Continue')
+    $f1Lines.Add('"F1_FLAGS=" + $flagsOut')
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        $f1Lines.Add('rev_exit && Write-Output ("CHAIN_RAN_" + "AFTER_FAILURE")')
+        $f1Lines.Add('rev_exit || Write-Output "OR_RAN"')
+        $f1Lines.Add('rev_ok && Write-Output "AND_RAN"')
+    }
+    $f1Lines.Add('exit')
+
+    $cF1 = Invoke-ShortcutsInjectedChild -CaseName 'finding1-exit-status' -WithoutPSReadLine -WorkingDirectory $outsideDir -ShortcutsPath $f1Store -Lines $f1Lines.ToArray()
+    Assert-True ($cF1.Stdout.Contains('F1_EXIT1=7;OK1=False')) "Finding 1: first rev_exit failed: $($cF1.Combined)"
+    Assert-True ($cF1.Stdout.Contains('F1_EXIT2=7;OK2=False')) "Finding 1: second consecutive rev_exit failed: $($cF1.Combined)"
+    Assert-True ($cF1.Stdout.Contains('F1_OK_AFTER=True;ERR=0')) "Finding 1: rev_ok after rev_exit failed: $($cF1.Combined)"
+    Assert-True ($cF1.Stdout.Contains('F1_WE_NULL=False;ERR=1')) "Finding 1: rev_fail 2>`$null failed: $($cF1.Combined)"
+    Assert-True ($cF1.Stdout.Contains('F1_WE_CAP=False;ERR=1;CAP=1;MSG=expected')) "Finding 1: rev_fail 2>&1 failed: $($cF1.Combined)"
+    Assert-True (-not $cF1.Stdout.Contains('F1_THROW_NOT_CAUGHT') -and -not $cF1.Stdout.Contains('F1_THROW_NOT_REACHED') -and $cF1.Stdout.Contains('F1_THROW_CAUGHT=boom') -and $cF1.Stdout.Contains('F1_THROW_OK=False;MSG=boom')) "Finding 1: rev_throw failed: $($cF1.Combined)"
+    Assert-True ($cF1.Stdout.Contains('F1_FLAGS=-v|--host|-Command|-ErrorAction|Continue')) "Finding 1: raw flags swallowed: $($cF1.Combined)"
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        Assert-True (-not $cF1.Stdout.Contains('CHAIN_RAN_AFTER_FAILURE')) "Finding 1: && ran RHS after rev_exit: $($cF1.Combined)"
+        Assert-True ($cF1.Stdout.Contains('OR_RAN')) "Finding 1: || did not run RHS after rev_exit: $($cF1.Combined)"
+        Assert-True ($cF1.Stdout.Contains('AND_RAN')) "Finding 1: && did not run RHS after rev_ok: $($cF1.Combined)"
+    }
+
+    # Finding 1 (OSC 133 D via StandInReader)
+    $f1OscStore = Join-Path $script:TempDir 'finding1-osc\shortcuts.json'
+    $cF1Osc = Invoke-ShortcutsInjectedChild -CaseName 'finding1-osc133d' -StandInReader -WorkingDirectory $outsideDir -ShortcutsPath $f1OscStore `
+        -Lines @(
+            'shortcut add rev_exit "cmd.exe /d /c exit 7"',
+            'shortcut add rev_ok "Write-Output ''OK''"',
+            'shortcut add rev_fail "Write-Error ''expected'' -ErrorAction Continue"',
+            'shortcut add rev_throw "throw ''boom''"',
+            '"MARK" + "_START"',
+            'rev_exit',
+            'rev_exit',
+            'rev_ok',
+            'rev_fail 2>$null',
+            'rev_throw',
+            '"MARK" + "_END"',
+            'exit'
+        )
+    $oscMatch = [regex]::Match($cF1Osc.Stdout, 'MARK_START(?<body>[\s\S]*?)MARK_END')
+    Assert-True $oscMatch.Success "Finding 1 (OSC 133 D): markers not found in stdout: $($cF1Osc.Combined)"
+    $dMatches = [regex]::Matches($oscMatch.Groups['body'].Value, '\x1B\]133;D;(\d+);aid=[^\x07]+\x07')
+    $dCodes = @($dMatches | ForEach-Object { $_.Groups[1].Value }) -join ','
+    Assert-True ($dCodes -eq '0,7,7,0,1,1') "Finding 1 (OSC 133 D): expected '0,7,7,0,1,1', got '$dCodes' in: $($oscMatch.Groups['body'].Value)"
+
+    # ── Finding 3 regressions: Caller session scope & zero variable shadowing ──
+    $f3Store = Join-Path $script:TempDir 'finding3\shortcuts.json'
+    $cF3 = Invoke-ShortcutsInjectedChild -CaseName 'finding3-scope-shadowing' -WithoutPSReadLine -WorkingDirectory $outsideDir -ShortcutsPath $f3Store `
+        -Lines @(
+            'shortcut add rev_setvar ''$reviewSessionVariable = 42; function reviewSessionFunction { "kept" }''',
+            'shortcut add rev_readvar ''Write-Output ("CMD=" + $Command + "|SB=" + $sb + "|DEPTH=" + $depth + "|CMDOK=" + $cmdOk)''',
+            'shortcut add rev_ok "Write-Output ''OK''"',
+            "shortcut add rev_cd `"Set-Location '$qRepoASub'`"",
+            'shortcut add rev_env ''$env:NOCTTY_F3_ENV = "persisted"''',
+            'function global:Test-ScopeIsolation { rev_setvar; "IN_FN_VAR=$reviewSessionVariable;IN_FN_FUNC=" + (reviewSessionFunction) }',
+            'shortcut add call_fn "Test-ScopeIsolation"',
+            'call_fn',
+            '"AFTER_FN_VAR=" + (Test-Path variable:global:reviewSessionVariable) + ";AFTER_FN_FUNC=" + ($null -ne (Get-Command reviewSessionFunction -Scope Global -ErrorAction Ignore))',
+            'rev_setvar',
+            '"PROMPT_VAR=$reviewSessionVariable;PROMPT_FUNC=" + (reviewSessionFunction)',
+            '$Command = "user-value"; $sb = "user-sb"; $depth = 999; $cmdOk = "user-ok"',
+            'rev_readvar',
+            '$beforeLocals = @(Get-Variable -Scope Local | Select-Object -ExpandProperty Name | Sort-Object)',
+            '$null = rev_ok',
+            '$afterLocals = @(Get-Variable -Scope Local | Select-Object -ExpandProperty Name | Sort-Object)',
+            '$leakedLocals = @($afterLocals | Where-Object { $_ -notin $beforeLocals -and $_ -ne "beforeLocals" })',
+            '"LEAKED_COUNT=" + $leakedLocals.Count + ";LEAKED=" + ($leakedLocals -join ",")',
+            'rev_cd',
+            'rev_env',
+            '"F3_CD=" + ($PWD.ProviderPath) + ";F3_ENV=" + $env:NOCTTY_F3_ENV',
+            'exit'
+        )
+    Assert-True ($cF3.Stdout.Contains('IN_FN_VAR=42;IN_FN_FUNC=kept')) "Finding 3: shortcut inside user function failed: $($cF3.Combined)"
+    Assert-True ($cF3.Stdout.Contains('AFTER_FN_VAR=False;AFTER_FN_FUNC=False')) "Finding 3: shortcut inside user function leaked to Global: $($cF3.Combined)"
+    Assert-True ($cF3.Stdout.Contains('PROMPT_VAR=42;PROMPT_FUNC=kept')) "Finding 3: prompt-level rev_setvar did not persist: $($cF3.Combined)"
+    Assert-True ($cF3.Stdout.Contains('CMD=user-value|SB=user-sb|DEPTH=999|CMDOK=user-ok')) "Finding 3: variable shadowing detected: $($cF3.Combined)"
+    Assert-True ($cF3.Stdout.Contains('LEAKED_COUNT=0;')) "Finding 3: wrapper locals leaked into caller scope: $($cF3.Combined)"
+    Assert-True ($cF3.Stdout.Contains("F3_CD=$repoASub;F3_ENV=persisted")) "Finding 3: cd / env mutation did not persist: $($cF3.Combined)"
+
+    # ── Finding 4 regressions: Pipeline input forwarding ──
+    $f4Store = Join-Path $script:TempDir 'finding4\shortcuts.json'
+    $cF4 = Invoke-ShortcutsInjectedChild -CaseName 'finding4-pipeline' -WithoutPSReadLine -WorkingDirectory $outsideDir -ShortcutsPath $f4Store `
+        -Lines @(
+            'shortcut add rev_pipe "Measure-Object"',
+            'shortcut add rev_where "Where-Object Val -eq 2"',
+            'shortcut add rev_findstr "findstr beta"',
+            'shortcut add rev_compound "Where-Object { `$_ -gt 2 } | Measure-Object"',
+            'shortcut add rev_accum "ForEach-Object { `$pipeSum += `$_ }"',
+            'shortcut add rev_fail "Write-Error ''expected'' -ErrorAction Continue"',
+            '"P_3=" + (1,2,3 | rev_pipe).Count',
+            '"P_EMPTY=" + (@() | rev_pipe).Count',
+            '"P_ONE=" + ("one" | rev_pipe).Count',
+            '"P_5=" + (1..5 | rev_pipe).Count',
+            '$pSum = 1,2,3 | rev_pipe -Sum',
+            '"P_SUM=$($pSum.Count):$($pSum.Sum)"',
+            '$objOut = [pscustomobject]@{Name="a";Val=1}, [pscustomobject]@{Name="b";Val=2} | rev_where',
+            '"P_OBJ=$($objOut -is [pscustomobject]):$($objOut.Name):$($objOut.Val)"',
+            '$fsHit = "alpha","beta" | rev_findstr',
+            '"FS_HIT=$fsHit;OK=$($?)"',
+            '"alpha" | rev_findstr',
+            '"FS_MISS=$LASTEXITCODE;OK=$($?)"',
+            '@() | rev_findstr',
+            '"FS_EMPTY=$LASTEXITCODE;OK=$($?)"',
+            '"P_COMP=" + (1..5 | rev_compound).Count',
+            '$pipeSum = 0; 1,2,3 | rev_accum',
+            '"P_ACCUM=$pipeSum"',
+            '1,2,3 | rev_fail 2>$null',
+            '"P_FAIL=$($?)"',
+            'exit'
+        )
+    Assert-True ($cF4.Stdout.Contains('P_3=3')) "Finding 4: 1,2,3 | rev_pipe failed: $($cF4.Combined)"
+    Assert-True ($cF4.Stdout.Contains('P_EMPTY=0')) "Finding 4: @() | rev_pipe failed: $($cF4.Combined)"
+    Assert-True ($cF4.Stdout.Contains('P_ONE=1')) "Finding 4: 'one' | rev_pipe failed: $($cF4.Combined)"
+    Assert-True ($cF4.Stdout.Contains('P_5=5')) "Finding 4: 1..5 | rev_pipe failed: $($cF4.Combined)"
+    Assert-True ($cF4.Stdout.Contains('P_SUM=3:6')) "Finding 4: 1,2,3 | rev_pipe -Sum failed: $($cF4.Combined)"
+    Assert-True ($cF4.Stdout.Contains('P_OBJ=True:b:2')) "Finding 4: non-string PSCustomObject pipeline failed: $($cF4.Combined)"
+    Assert-True ($cF4.Stdout.Contains('FS_HIT=beta;OK=True')) "Finding 4: native stdin hit failed: $($cF4.Combined)"
+    Assert-True ($cF4.Stdout.Contains('FS_MISS=1;OK=False')) "Finding 4: native stdin miss failed: $($cF4.Combined)"
+    Assert-True ($cF4.Stdout.Contains('FS_EMPTY=1;OK=False')) "Finding 4: native stdin empty failed: $($cF4.Combined)"
+    Assert-True ($cF4.Stdout.Contains('P_COMP=3')) "Finding 4: compound pipeline shortcut failed: $($cF4.Combined)"
+    Assert-True ($cF4.Stdout.Contains('P_ACCUM=6')) "Finding 4: piped shortcut caller var mutation failed: $($cF4.Combined)"
+    Assert-True ($cF4.Stdout.Contains('P_FAIL=False')) "Finding 4: piped Write-Error `$? failed: $($cF4.Combined)"
 
     Write-Host ("All PowerShell shortcuts tests passed ({0} assertions)." -f $script:AssertionCount) -ForegroundColor Green
 } finally {

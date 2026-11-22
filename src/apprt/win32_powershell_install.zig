@@ -910,7 +910,7 @@ test "integration.ps1 honours the injected block scope" {
     }
     // Guard the guard: if either scan stops matching, everything above turns
     // vacuous. These are the live counts; bump them when the script grows.
-    try std.testing.expectEqual(@as(usize, 38), declarations);
+    try std.testing.expectEqual(@as(usize, 40), declarations);
     try std.testing.expectEqual(@as(usize, 13), top_level_variables);
     // Unbalanced braces here mean the tracker desynced (an unterminated
     // string, a here-string, nesting past the stack), which would silently
@@ -979,7 +979,9 @@ test "integration.ps1 honours the injected block scope" {
         "__ghostty_mutate_shortcuts",
         "__ghostty_shortcut_lookup",
         "__ghostty_escape_single_quote",
-        "__ghostty_run_shortcut",
+        "__ghostty_shortcut_reflect",
+        "__ghostty_shortcut_prepare",
+        "__ghostty_shortcut_exit",
         "__ghostty_install_shortcut_hook",
         "__ghostty_shortcut_cli_exists",
         "__ghostty_shortcut_cli_is_ours",
@@ -1792,7 +1794,7 @@ test "integration.ps1 changes only with its revision" {
     // whether to bump in front of the author and the reviewer; it cannot judge
     // whether the change needed one.
     const pinned_revision: u32 = 3;
-    const pinned_sha256 = "4b84d9abdbad4852816bf7b528c86e96093c48664363fea610989384f9711d85";
+    const pinned_sha256 = "70805a53800af4529b6e7e3885bf197b7b4c2961a1ac956929e3d9d9a40f0cfb";
     const hex = std.fmt.bytesToHex(integration_script_sha256, .lower);
     try std.testing.expectEqual(@as(?u32, pinned_revision), scriptRevision(integration_script));
     try std.testing.expectEqualStrings(pinned_sha256, &hex);
@@ -2143,7 +2145,12 @@ test "integration.ps1 hooks shortcuts via CommandNotFoundAction with zero prompt
     try std.testing.expect(codeContains("__ghostty_shortcut_checking"));
     try std.testing.expect(codeContains("__ghostty_shortcut_in_lookup"));
     try std.testing.expect(codeContains("__ghostty_shortcut_depth"));
-    try std.testing.expect(codeContains("__ghostty_run_shortcut"));
+    try std.testing.expect(codeContains("__ghostty_shortcut_reflect"));
+    try std.testing.expect(codeContains("__ghostty_shortcut_prepare"));
+    try std.testing.expect(codeContains("__ghostty_shortcut_exit"));
+    try std.testing.expect(codeContains("GetSteppablePipeline"));
+    try std.testing.expect(codeContains("ExecutionFailed"));
+    try std.testing.expect(codeContains("CurrentScope"));
     try std.testing.expect(codeContains("__ghostty_shortcut_cli_marker"));
     try std.testing.expect(codeContains("__ghostty_shortcut_cli_exists"));
     try std.testing.expect(codeContains("function global:__ghostty_mutate_shortcuts {"));
