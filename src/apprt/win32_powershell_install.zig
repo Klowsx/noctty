@@ -910,7 +910,7 @@ test "integration.ps1 honours the injected block scope" {
     }
     // Guard the guard: if either scan stops matching, everything above turns
     // vacuous. These are the live counts; bump them when the script grows.
-    try std.testing.expectEqual(@as(usize, 36), declarations);
+    try std.testing.expectEqual(@as(usize, 38), declarations);
     try std.testing.expectEqual(@as(usize, 13), top_level_variables);
     // Unbalanced braces here mean the tracker desynced (an unterminated
     // string, a here-string, nesting past the stack), which would silently
@@ -974,7 +974,9 @@ test "integration.ps1 honours the injected block scope" {
         "__ghostty_normalize_project_root",
         "__ghostty_find_git_root",
         "__ghostty_load_shortcuts",
+        "__ghostty_trim_transient_errors",
         "__ghostty_save_shortcuts",
+        "__ghostty_mutate_shortcuts",
         "__ghostty_shortcut_lookup",
         "__ghostty_escape_single_quote",
         "__ghostty_run_shortcut",
@@ -1789,8 +1791,8 @@ test "integration.ps1 changes only with its revision" {
     // to the revision and SHA-256 it now has, which puts the question of
     // whether to bump in front of the author and the reviewer; it cannot judge
     // whether the change needed one.
-    const pinned_revision: u32 = 2;
-    const pinned_sha256 = "7db8b62432d50317bc1d05690c5f0419ed18ed76105ce38c22f57e324038d208";
+    const pinned_revision: u32 = 3;
+    const pinned_sha256 = "4b84d9abdbad4852816bf7b528c86e96093c48664363fea610989384f9711d85";
     const hex = std.fmt.bytesToHex(integration_script_sha256, .lower);
     try std.testing.expectEqual(@as(?u32, pinned_revision), scriptRevision(integration_script));
     try std.testing.expectEqualStrings(pinned_sha256, &hex);
@@ -2144,6 +2146,15 @@ test "integration.ps1 hooks shortcuts via CommandNotFoundAction with zero prompt
     try std.testing.expect(codeContains("__ghostty_run_shortcut"));
     try std.testing.expect(codeContains("__ghostty_shortcut_cli_marker"));
     try std.testing.expect(codeContains("__ghostty_shortcut_cli_exists"));
+    try std.testing.expect(codeContains("function global:__ghostty_mutate_shortcuts {"));
+    try std.testing.expect(codeContains("__ghostty_mutate_shortcuts {"));
+    try std.testing.expect(codeContains("[System.IO.File]::Replace($tmpPath, $path, [NullString]::Value, $true)"));
+    try std.testing.expect(!codeContains("[System.IO.File]::Copy("));
+    try std.testing.expect(codeContains(".get_Keys()"));
+    try std.testing.expect(codeContains(".get_Count()"));
+    try std.testing.expect(!codeContains("$map.Keys"));
+    try std.testing.expect(!codeContains(".Global.Count"));
+    try std.testing.expect(!codeContains(".Projects.Count"));
     try std.testing.expect(!codeContains("Get-Command -Name 'shortcut'"));
     try std.testing.expect(!codeContains(".GetNewClosure()"));
     try std.testing.expect(!codeContains("-AddToHistoryHandler {"));

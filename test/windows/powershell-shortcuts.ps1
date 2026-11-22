@@ -1,5 +1,6 @@
 param(
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
+    [string]$IntegrationPath = ''
 )
 
 . (Join-Path $PSScriptRoot '..\..\scripts\windows-harness-history.ps1')
@@ -35,7 +36,11 @@ $script:OriginalShortcut = $function:global:shortcut
 $script:OriginalCommandNotFound = $ExecutionContext.InvokeCommand.CommandNotFoundAction
 $script:OriginalShortcutsPath = $env:NOCTTY_SHORTCUTS_PATH
 $script:OriginalHistoryOptions = $null
-$script:IntegrationPath = Join-Path $RepoRoot 'src\shell-integration\powershell\integration.ps1'
+$script:IntegrationPath = if ([string]::IsNullOrWhiteSpace($IntegrationPath)) {
+    Join-Path $RepoRoot 'src\shell-integration\powershell\integration.ps1'
+} else {
+    (Resolve-Path -LiteralPath $IntegrationPath).Path
+}
 $script:TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("noctty-ps-shortcuts-" + [guid]::NewGuid().ToString('n'))
 
 function Disable-ParentPSReadLineHistory {
@@ -543,6 +548,316 @@ try {
         Remove-Item -LiteralPath 'Function:\__noctty_test_user_fn' -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath 'Alias:\__noctty_test_user_alias' -Force -ErrorAction SilentlyContinue
     }
+
+    # ── Finding 2 regressions: Concurrent store transactions, locks, and corrupt JSON ──
+    function Invoke-BarrierPair {
+        param(
+            [Parameter(Mandatory)][string]$CaseName,
+            [Parameter(Mandatory)][string]$StorePath,
+            [Parameter(Mandatory)][string]$DirA,
+            [Parameter(Mandatory)][string]$DirB,
+            [Parameter(Mandatory)][string[]]$CommandsA,
+            [Parameter(Mandatory)][string[]]$CommandsB,
+            [int]$Rounds = 1
+        )
+        $readyAName = 'Local\noctty-sc-readyA-' + [guid]::NewGuid().ToString('n')
+        $readyBName = 'Local\noctty-sc-readyB-' + [guid]::NewGuid().ToString('n')
+        $goNames = @(for ($r = 0; $r -lt $Rounds; $r++) { 'Local\noctty-sc-go-' + $r + '-' + [guid]::NewGuid().ToString('n') })
+
+        $readyA = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::AutoReset, $readyAName)
+        $readyB = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::AutoReset, $readyBName)
+        $goEvents = @(foreach ($gn in $goNames) { [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::ManualReset, $gn) })
+
+        try {
+            $infoA = New-InjectedChildStartInfo -CaseName ($CaseName + '-A') -WithoutPSReadLine -WorkingDirectory $DirA -ShortcutsPath $StorePath
+            $infoB = New-InjectedChildStartInfo -CaseName ($CaseName + '-B') -WithoutPSReadLine -WorkingDirectory $DirB -ShortcutsPath $StorePath
+
+            $parentInputEncoding = [Console]::InputEncoding
+            try {
+                [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+                $procA = [System.Diagnostics.Process]::Start($infoA)
+                $procB = [System.Diagnostics.Process]::Start($infoB)
+            } finally {
+                [Console]::InputEncoding = $parentInputEncoding
+            }
+
+            try {
+                $errA = [NocttyShortcutsChildOutput]::new()
+                $errB = [NocttyShortcutsChildOutput]::new()
+                $errATask = $errA.DrainAsync($procA.StandardError)
+                $errBTask = $errB.DrainAsync($procB.StandardError)
+
+                foreach ($pair in @(@($procA, 'A'), @($procB, 'B'))) {
+                    $p = $pair[0]
+                    $tag = $pair[1]
+                    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+                    while ($true) {
+                        $lineTask = $p.StandardOutput.ReadLineAsync()
+                        $rem = [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+                        if (-not $lineTask.Wait($rem) -or $null -eq $lineTask.Result) {
+                            if (-not $p.HasExited) { $p.Kill() }
+                            throw "$CaseName child $tag did not confirm history isolation"
+                        }
+                        $txt = $lineTask.Result -replace '\x1B\[[0-?]*[ -/]*[@-~]', ''
+                        if ($txt -eq 'HISTORY-ISOLATED') { break }
+                    }
+                }
+
+                $outA = [NocttyShortcutsChildOutput]::new()
+                $outB = [NocttyShortcutsChildOutput]::new()
+                $outATask = $outA.DrainAsync($procA.StandardOutput)
+                $outBTask = $outB.DrainAsync($procB.StandardOutput)
+
+                $qReadyA = ConvertTo-PowerShellLiteralContent $readyAName
+                $qReadyB = ConvertTo-PowerShellLiteralContent $readyBName
+                $procA.StandardInput.WriteLine("`$__ra = [System.Threading.EventWaitHandle]::OpenExisting('$qReadyA')")
+                $procB.StandardInput.WriteLine("`$__rb = [System.Threading.EventWaitHandle]::OpenExisting('$qReadyB')")
+
+                for ($r = 0; $r -lt $Rounds; $r++) {
+                    $qGo = ConvertTo-PowerShellLiteralContent $goNames[$r]
+                    $procA.StandardInput.WriteLine("`$__go$r = [System.Threading.EventWaitHandle]::OpenExisting('$qGo'); [void]`$__ra.Set(); if (-not `$__go$r.WaitOne(20000)) { throw 'go timeout A' }; `$__go$r.Dispose()")
+                    $procB.StandardInput.WriteLine("`$__go$r = [System.Threading.EventWaitHandle]::OpenExisting('$qGo'); [void]`$__rb.Set(); if (-not `$__go$r.WaitOne(20000)) { throw 'go timeout B' }; `$__go$r.Dispose()")
+                    $procA.StandardInput.WriteLine($CommandsA[$r])
+                    $procB.StandardInput.WriteLine($CommandsB[$r])
+                }
+
+                $procA.StandardInput.WriteLine('"ERRCOUNT_A=" + $Error.Count; $__ra.Dispose(); exit')
+                $procB.StandardInput.WriteLine('"ERRCOUNT_B=" + $Error.Count; $__rb.Dispose(); exit')
+                $procA.StandardInput.Close()
+                $procB.StandardInput.Close()
+
+                for ($r = 0; $r -lt $Rounds; $r++) {
+                    Assert-True ($readyA.WaitOne(20000)) "$CaseName round $r`: child A did not reach barrier"
+                    Assert-True ($readyB.WaitOne(20000)) "$CaseName round $r`: child B did not reach barrier"
+                    [void]$goEvents[$r].Set()
+                }
+
+                if (-not $procA.WaitForExit(20000)) {
+                    if (-not $procA.HasExited) { $procA.Kill() }
+                    throw "$CaseName child A timed out"
+                }
+                if (-not $procB.WaitForExit(20000)) {
+                    if (-not $procB.HasExited) { $procB.Kill() }
+                    throw "$CaseName child B timed out"
+                }
+                [void]$outATask.GetAwaiter().GetResult()
+                [void]$errATask.GetAwaiter().GetResult()
+                [void]$outBTask.GetAwaiter().GetResult()
+                [void]$errBTask.GetAwaiter().GetResult()
+
+                return [pscustomobject]@{
+                    CombinedA = $outA.ToString() + $errA.ToString()
+                    CombinedB = $outB.ToString() + $errB.ToString()
+                    ExitCodeA = $procA.ExitCode
+                    ExitCodeB = $procB.ExitCode
+                }
+            } finally {
+                $procA.Dispose()
+                $procB.Dispose()
+            }
+        } finally {
+            $readyA.Dispose()
+            $readyB.Dispose()
+            foreach ($ge in $goEvents) { $ge.Dispose() }
+        }
+    }
+
+    # Finding 2a: Concurrent add/add (global) behind EventWaitHandle barrier (3 rounds)
+    $raceAddStore = Join-Path $script:TempDir 'race-add\shortcuts.json'
+    $raceAddRes = Invoke-BarrierPair -CaseName 'race-add-add' -StorePath $raceAddStore -DirA $outsideDir -DirB $outsideDir -Rounds 3 `
+        -CommandsA @(
+            'shortcut add rev_race_a1 "Write-Output ''a1''"',
+            'shortcut add rev_race_a2 "Write-Output ''a2''"',
+            'shortcut add rev_race_a3 "Write-Output ''a3''"'
+        ) `
+        -CommandsB @(
+            'shortcut add rev_race_b1 "Write-Output ''b1''"',
+            'shortcut add rev_race_b2 "Write-Output ''b2''"',
+            'shortcut add rev_race_b3 "Write-Output ''b3''"'
+        )
+    Assert-True ($raceAddRes.ExitCodeA -eq 0 -and $raceAddRes.ExitCodeB -eq 0) "Finding 2a: barrier children exited non-zero: A=$($raceAddRes.CombinedA) B=$($raceAddRes.CombinedB)"
+    Assert-True ($raceAddRes.CombinedA.Contains('ERRCOUNT_A=0') -and $raceAddRes.CombinedB.Contains('ERRCOUNT_B=0')) "Finding 2a: retry polluted `$Error: A=$($raceAddRes.CombinedA) B=$($raceAddRes.CombinedB)"
+    $raceAddVerify = Invoke-ShortcutsInjectedChild -CaseName 'race-add-verify' -WithoutPSReadLine -WorkingDirectory $outsideDir -ShortcutsPath $raceAddStore `
+        -Lines @(
+            '"LIST=" + ((shortcut list) -join ";")',
+            'rev_race_a1; rev_race_b1; rev_race_a2; rev_race_b2; rev_race_a3; rev_race_b3',
+            'exit'
+        )
+    foreach ($expectedKey in @('rev_race_a1', 'rev_race_b1', 'rev_race_a2', 'rev_race_b2', 'rev_race_a3', 'rev_race_b3')) {
+        Assert-True ($raceAddVerify.Stdout.Contains("$expectedKey ->")) "Finding 2a: lost '$expectedKey' in concurrent add/add: $($raceAddVerify.Combined)"
+    }
+
+    # Finding 2b: Concurrent add/remove behind EventWaitHandle barrier
+    $raceAddRmStore = Join-Path $script:TempDir 'race-add-rm\shortcuts.json'
+    $seedAddRm = Invoke-ShortcutsInjectedChild -CaseName 'race-add-rm-seed' -WithoutPSReadLine -WorkingDirectory $outsideDir -ShortcutsPath $raceAddRmStore `
+        -Lines @(
+            'shortcut add seed_keep "Write-Output ''keep''"',
+            'shortcut add seed_drop "Write-Output ''drop''"',
+            'exit'
+        )
+    Assert-True ($seedAddRm.Combined.Contains("Saved global shortcut 'seed_drop'")) "Finding 2b: seed failed: $($seedAddRm.Combined)"
+    $raceAddRmRes = Invoke-BarrierPair -CaseName 'race-add-remove' -StorePath $raceAddRmStore -DirA $outsideDir -DirB $outsideDir -Rounds 1 `
+        -CommandsA @('shortcut remove seed_drop') `
+        -CommandsB @('shortcut add race_added "Write-Output ''added-ok''"')
+    Assert-True ($raceAddRmRes.ExitCodeA -eq 0 -and $raceAddRmRes.ExitCodeB -eq 0) "Finding 2b: barrier children failed: A=$($raceAddRmRes.CombinedA) B=$($raceAddRmRes.CombinedB)"
+    $raceAddRmVerify = Invoke-ShortcutsInjectedChild -CaseName 'race-add-rm-verify' -WithoutPSReadLine -WorkingDirectory $outsideDir -ShortcutsPath $raceAddRmStore `
+        -Lines @(
+            '"LIST=" + ((shortcut list) -join ";")',
+            'exit'
+        )
+    Assert-True ($raceAddRmVerify.Stdout.Contains('seed_keep ->') -and $raceAddRmVerify.Stdout.Contains('race_added ->') -and (-not $raceAddRmVerify.Stdout.Contains('seed_drop ->'))) `
+        "Finding 2b: unexpected set after concurrent add/remove: $($raceAddRmVerify.Combined)"
+
+    # Finding 2c: Concurrent add --project in two different Git repos behind EventWaitHandle barrier
+    $raceProjStore = Join-Path $script:TempDir 'race-proj\shortcuts.json'
+    $raceProjRes = Invoke-BarrierPair -CaseName 'race-add-project' -StorePath $raceProjStore -DirA $repoA -DirB $repoB -Rounds 1 `
+        -CommandsA @('shortcut add --project proj_race_a "Write-Output ''pa''"') `
+        -CommandsB @('shortcut add --project proj_race_b "Write-Output ''pb''"')
+    Assert-True ($raceProjRes.ExitCodeA -eq 0 -and $raceProjRes.ExitCodeB -eq 0) "Finding 2c: barrier children failed: A=$($raceProjRes.CombinedA) B=$($raceProjRes.CombinedB)"
+    $raceProjVerify = Invoke-ShortcutsInjectedChild -CaseName 'race-proj-verify' -WithoutPSReadLine -WorkingDirectory $repoA -ShortcutsPath $raceProjStore `
+        -Lines @(
+            '"LIST_A=" + ((shortcut list --project) -join ";")',
+            "Set-Location '$qRepoB'",
+            '"LIST_B=" + ((shortcut list --project) -join ";")',
+            'exit'
+        )
+    Assert-True ($raceProjVerify.Stdout.Contains('proj_race_a ->') -and $raceProjVerify.Stdout.Contains('proj_race_b ->')) `
+        "Finding 2c: lost project shortcut in concurrent add --project: $($raceProjVerify.Combined)"
+
+    # Finding 2d: Held lock timeout leaves store untouched and does not poison cache
+    $lockTimeoutStore = Join-Path $script:TempDir 'lock-timeout\shortcuts.json'
+    $env:NOCTTY_SHORTCUTS_PATH = $lockTimeoutStore
+    $Global:__ghostty_shortcut_cache = $null
+    $null = shortcut add before_lock "Write-Output 'untouched'"
+    $beforeBytes = [System.IO.File]::ReadAllText($lockTimeoutStore, [System.Text.Encoding]::UTF8)
+    $lockFilePath = $lockTimeoutStore + '.lock'
+    $heldLock = [System.IO.FileStream]::new($lockFilePath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try {
+        $timedOutMsg = ''
+        try {
+            __ghostty_mutate_shortcuts -LockTimeoutMs 200 -Mutation {
+                param($d)
+                $d.Global.set_Item('should_not_exist', 'bad')
+                return $true
+            }
+        } catch {
+            $timedOutMsg = $_.Exception.Message
+        }
+        Assert-True ($timedOutMsg.Contains('Timed out after 200ms')) "Finding 2d: expected lock timeout error, got: $timedOutMsg"
+        $afterBytes = [System.IO.File]::ReadAllText($lockTimeoutStore, [System.Text.Encoding]::UTF8)
+        Assert-True ($beforeBytes -ceq $afterBytes) "Finding 2d: shortcuts.json was modified on lock timeout"
+        $cacheAfterTimeout = $Global:__ghostty_shortcut_cache
+        Assert-True ($null -ne $cacheAfterTimeout -and $cacheAfterTimeout.Global.ContainsKey('before_lock') -and (-not $cacheAfterTimeout.Global.ContainsKey('should_not_exist'))) `
+            "Finding 2d: shortcut cache was poisoned on lock timeout"
+    } finally {
+        $heldLock.Dispose()
+    }
+
+    # Finding 2e: Killed lock-holder recovery (OS releases lock when holder process dies)
+    $killLockStore = Join-Path $script:TempDir 'kill-lock\shortcuts.json'
+    $killLockPath = $killLockStore + '.lock'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $killLockStore) | Out-Null
+    $killReadyName = 'Local\noctty-kill-lock-' + [guid]::NewGuid().ToString('n')
+    $killReady = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::AutoReset, $killReadyName)
+    try {
+        $qKillLock = ConvertTo-PowerShellLiteralContent $killLockPath
+        $qKillReady = ConvertTo-PowerShellLiteralContent $killReadyName
+        $holderScript = "`$fs = [System.IO.FileStream]::new('$qKillLock', [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None); `$ev = [System.Threading.EventWaitHandle]::OpenExisting('$qKillReady'); [void]`$ev.Set(); Start-Sleep -Seconds 30"
+        $holderInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $holderInfo.FileName = $script:PsHost
+        $holderInfo.Arguments = '-NoProfile -ExecutionPolicy Bypass -Command "' + $holderScript + '"'
+        $holderInfo.UseShellExecute = $false
+        $holderInfo.CreateNoWindow = $true
+        $holderProc = [System.Diagnostics.Process]::Start($holderInfo)
+        try {
+            Assert-True ($killReady.WaitOne(15000)) "Finding 2e: lock-holder child did not signal ready"
+            $holderProc.Kill()
+            [void]$holderProc.WaitForExit(5000)
+        } finally {
+            $holderProc.Dispose()
+        }
+        $afterKillRes = Invoke-ShortcutsInjectedChild -CaseName 'after-kill-lock' -WithoutPSReadLine -WorkingDirectory $outsideDir -ShortcutsPath $killLockStore `
+            -Lines @(
+                'shortcut add after_kill "Write-Output ''lock-released''"',
+                '"OUT=" + (after_kill)',
+                'exit'
+            )
+        Assert-True ($afterKillRes.Stdout.Contains('OUT=lock-released')) "Finding 2e: failed to acquire lock after holder was killed: $($afterKillRes.Combined)"
+    } finally {
+        $killReady.Dispose()
+    }
+
+    # Finding 2f: Corrupt JSON ({broken and []) fails cleanly without wiping file or poisoning cache
+    foreach ($corruptPayload in @('{broken', '[]')) {
+        $corruptStore = Join-Path $script:TempDir ('corrupt-' + [guid]::NewGuid().ToString('n') + '\shortcuts.json')
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $corruptStore) | Out-Null
+        [System.IO.File]::WriteAllText($corruptStore, $corruptPayload, [System.Text.UTF8Encoding]::new($false))
+        $corruptChild = Invoke-ShortcutsInjectedChild -CaseName 'corrupt-json' -WithoutPSReadLine -WorkingDirectory $outsideDir -ShortcutsPath $corruptStore `
+            -Lines @(
+                '$Global:__ghostty_shortcut_cache = [pscustomobject]@{ Sentinel = "kept" }',
+                'try { shortcut add after_corrupt "Write-Output ''nope''"; "ADD_UNEXPECTED_OK" } catch { "ADD_THREW=" + $_.Exception.Message }',
+                '"CACHE_SENTINEL=" + $Global:__ghostty_shortcut_cache.Sentinel',
+                'exit'
+            )
+        $diskAfterCorrupt = [System.IO.File]::ReadAllText($corruptStore, [System.Text.Encoding]::UTF8)
+        Assert-True ($diskAfterCorrupt -ceq $corruptPayload) "Finding 2f ($corruptPayload): corrupt store was wiped or overwritten: $diskAfterCorrupt"
+        Assert-True ($corruptChild.Stdout.Contains('ADD_THREW=')) "Finding 2f ($corruptPayload): expected error on corrupt JSON, got: $($corruptChild.Combined)"
+        Assert-True ($corruptChild.Stdout.Contains('CACHE_SENTINEL=kept')) "Finding 2f ($corruptPayload): cache was poisoned on corrupt JSON: $($corruptChild.Combined)"
+    }
+
+    # ── Finding 5 regressions: Hashtable member collisions (global and --project) ──
+    $collNames = @('keys', 'count', 'values', 'item', 'isreadonly', 'syncroot', 'containskey', 'get_keys', 'get_count')
+    $collInvokeNames = @('keys', 'count', 'values', 'isreadonly', 'syncroot', 'containskey', 'get_keys', 'get_count')
+    $collStore = Join-Path $script:TempDir 'hashtable-collisions\shortcuts.json'
+    $collLines = [System.Collections.Generic.List[string]]::new()
+    $collLines.Add('shortcut add normal_sc "Write-Output ''normal-ok''"')
+    foreach ($cn in $collNames) {
+        $collLines.Add("shortcut add $cn `"Write-Output 'g-$cn'`"")
+    }
+    $collLines.Add('"GLIST=" + ((shortcut list) -join ";")')
+    foreach ($cn in $collInvokeNames) {
+        $collLines.Add("`"GINV_$cn=`" + ($cn)")
+    }
+    $collLines.Add('"GINV_normal=" + (normal_sc)')
+    $collLines.Add('shortcut add count "Write-Output ''g-count-updated''"')
+    $collLines.Add('"GUPD_count=" + (count)')
+    foreach ($cn in $collNames) {
+        $collLines.Add("shortcut remove $cn")
+    }
+    $collLines.Add('"GLIST_AFTER=" + ((shortcut list) -join ";")')
+    $collLines.Add('shortcut add --project normal_sc "Write-Output ''pnormal-ok''"')
+    foreach ($cn in $collNames) {
+        $collLines.Add("shortcut add --project $cn `"Write-Output 'p-$cn'`"")
+    }
+    $collLines.Add('"PLIST=" + ((shortcut list --project) -join ";")')
+    foreach ($cn in $collInvokeNames) {
+        $collLines.Add("`"PINV_$cn=`" + ($cn)")
+    }
+    $collLines.Add('"PINV_normal=" + (normal_sc)')
+    $collLines.Add('shortcut add --project count "Write-Output ' + "'p-count-updated'" + '"')
+    $collLines.Add('"PUPD_count=" + (count)')
+    foreach ($cn in $collNames) {
+        $collLines.Add("shortcut remove --project $cn")
+    }
+    $collLines.Add('"PLIST_AFTER=" + ((shortcut list --project) -join ";")')
+    $collLines.Add('exit')
+
+    $cColl = Invoke-ShortcutsInjectedChild -CaseName 'hashtable-collisions' -WithoutPSReadLine -WorkingDirectory $repoA -ShortcutsPath $collStore -Lines $collLines.ToArray()
+    Assert-True ($cColl.ExitCode -eq 0) "Finding 5: child exited non-zero: $($cColl.Combined)"
+    Assert-True ($cColl.Stdout.Contains("GLIST=") -and $cColl.Stdout.Contains("normal_sc -> Write-Output 'normal-ok'")) "Finding 5: global list missing normal_sc: $($cColl.Combined)"
+    Assert-True ($cColl.Stdout.Contains("PLIST=") -and $cColl.Stdout.Contains("normal_sc -> Write-Output 'pnormal-ok'")) "Finding 5: project list missing normal_sc: $($cColl.Combined)"
+    foreach ($cn in $collNames) {
+        Assert-True ($cColl.Stdout.Contains("$cn -> Write-Output 'g-$cn'")) "Finding 5: global list missing '$cn': $($cColl.Combined)"
+        Assert-True ($cColl.Stdout.Contains("$cn -> Write-Output 'p-$cn'")) "Finding 5: project list missing '$cn': $($cColl.Combined)"
+    }
+    foreach ($cn in $collInvokeNames) {
+        Assert-True ($cColl.Stdout.Contains("GINV_$cn=g-$cn")) "Finding 5: global invoke failed for '$cn': $($cColl.Combined)"
+        Assert-True ($cColl.Stdout.Contains("PINV_$cn=p-$cn")) "Finding 5: project invoke failed for '$cn': $($cColl.Combined)"
+    }
+    Assert-True ($cColl.Stdout.Contains('GUPD_count=g-count-updated')) "Finding 5: global update of 'count' failed: $($cColl.Combined)"
+    Assert-True ($cColl.Stdout.Contains('PUPD_count=p-count-updated')) "Finding 5: project update of 'count' failed: $($cColl.Combined)"
+    Assert-True ($cColl.Stdout.Contains("GLIST_AFTER=normal_sc -> Write-Output 'normal-ok'")) "Finding 5: global list after removes unexpected: $($cColl.Combined)"
+    Assert-True ($cColl.Stdout.Contains("PLIST_AFTER=normal_sc -> Write-Output 'pnormal-ok'")) "Finding 5: project list after removes unexpected: $($cColl.Combined)"
 
     Write-Host ("All PowerShell shortcuts tests passed ({0} assertions)." -f $script:AssertionCount) -ForegroundColor Green
 } finally {

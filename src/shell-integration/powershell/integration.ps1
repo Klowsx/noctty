@@ -1,6 +1,6 @@
 # Noctty shell integration for PowerShell 5.1+ / pwsh 7+
 # Emits OSC 133 (command marking) and OSC 7 (current working directory) sequences.
-# noctty-integration-revision: 2
+# noctty-integration-revision: 3
 #   Raise it when a change must not be undone by an older noctty that shares
 #   the installed copy; see src/apprt/win32_powershell_install.zig.
 #
@@ -1114,21 +1114,25 @@ __ghostty_install_alias 'PSConsoleHostReadLine' '__ghostty_readline'
 # call or first CommandNotFoundAction miss, and cached by mtime + length.
 
 function global:__ghostty_shortcuts_path {
+    $rawPath = $null
     if (-not [string]::IsNullOrWhiteSpace($env:NOCTTY_SHORTCUTS_PATH)) {
-        return $env:NOCTTY_SHORTCUTS_PATH
-    }
-    if (-not [string]::IsNullOrWhiteSpace($env:XDG_CONFIG_HOME)) {
-        return (Join-Path $env:XDG_CONFIG_HOME 'noctty\shortcuts.json')
-    }
-    if (-not [string]::IsNullOrWhiteSpace($env:GHOSTTY_BIN_DIR) -and
+        $rawPath = $env:NOCTTY_SHORTCUTS_PATH
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:XDG_CONFIG_HOME)) {
+        $rawPath = (Join-Path $env:XDG_CONFIG_HOME 'noctty\shortcuts.json')
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:GHOSTTY_BIN_DIR) -and
         (Test-Path -LiteralPath (Join-Path $env:GHOSTTY_BIN_DIR 'noctty.portable') -PathType Leaf)) {
-        return (Join-Path $env:GHOSTTY_BIN_DIR 'shortcuts.json')
+        $rawPath = (Join-Path $env:GHOSTTY_BIN_DIR 'shortcuts.json')
+    } else {
+        $localAppData = $env:LOCALAPPDATA
+        if ([string]::IsNullOrWhiteSpace($localAppData)) {
+            $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+        }
+        $rawPath = (Join-Path $localAppData 'noctty\shortcuts.json')
     }
-    $localAppData = $env:LOCALAPPDATA
-    if ([string]::IsNullOrWhiteSpace($localAppData)) {
-        $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+    if ([System.IO.Path]::IsPathRooted($rawPath)) {
+        return [System.IO.Path]::GetFullPath($rawPath)
     }
-    return (Join-Path $localAppData 'noctty\shortcuts.json')
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($rawPath)
 }
 
 function global:__ghostty_normalize_project_root {
@@ -1166,8 +1170,37 @@ function global:__ghostty_find_git_root {
     return $null
 }
 
+function global:__ghostty_trim_transient_errors {
+    param($PrevHead)
+    try {
+        while ($Error.Count -gt 0) {
+            $top = $Error[0]
+            if ($null -ne $PrevHead -and (__ghostty_same_object $top $PrevHead)) {
+                break
+            }
+            $ex = $null
+            if ($null -ne $top -and $null -ne $top.PSObject.Properties['Exception']) {
+                $ex = $top.Exception
+            }
+            while ($ex -is [System.Management.Automation.MethodInvocationException] -and $null -ne $ex.InnerException) {
+                $ex = $ex.InnerException
+            }
+            if ($ex -is [System.IO.IOException] -or $ex -is [System.UnauthorizedAccessException]) {
+                $Error.RemoveAt(0)
+            } else {
+                break
+            }
+        }
+    } catch {
+        # Best-effort cleanup; never fail a succeeded operation on $Error trimming.
+    }
+}
+
 function global:__ghostty_load_shortcuts {
-    param([switch]$IgnoreReadError)
+    param(
+        [switch]$IgnoreReadError,
+        [switch]$BypassCache
+    )
     $path = __ghostty_shortcuts_path
     $exists = $false
     $ticks = [long]0
@@ -1178,13 +1211,15 @@ function global:__ghostty_load_shortcuts {
         $ticks = $info.LastWriteTimeUtc.Ticks
         $length = $info.Length
     }
-    $cache = __ghostty_read_global '__ghostty_shortcut_cache'
-    if ($null -ne $cache -and
-        $cache.Path -ceq $path -and
-        $cache.Exists -eq $exists -and
-        $cache.Ticks -eq $ticks -and
-        $cache.Length -eq $length) {
-        return $cache
+    if (-not $BypassCache) {
+        $cache = __ghostty_read_global '__ghostty_shortcut_cache'
+        if ($null -ne $cache -and
+            $cache.Path -ceq $path -and
+            $cache.Exists -eq $exists -and
+            $cache.Ticks -eq $ticks -and
+            $cache.Length -eq $length) {
+            return $cache
+        }
     }
 
     $globalMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -1192,27 +1227,68 @@ function global:__ghostty_load_shortcuts {
 
     if ($exists) {
         try {
-            $raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+            $raw = $null
+            $shareMode = ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+            $readOk = $false
+            $lastReadErr = $null
+            $errHead = __ghostty_error_head
+            for ($attempt = 0; $attempt -lt 8; $attempt++) {
+                try {
+                    $fs = [System.IO.FileStream]::new(
+                        $path,
+                        [System.IO.FileMode]::Open,
+                        [System.IO.FileAccess]::Read,
+                        $shareMode
+                    )
+                    try {
+                        $sr = [System.IO.StreamReader]::new($fs, [System.Text.Encoding]::UTF8, $true)
+                        try {
+                            $raw = $sr.ReadToEnd()
+                        } finally {
+                            $sr.Dispose()
+                        }
+                    } finally {
+                        $fs.Dispose()
+                    }
+                    $readOk = $true
+                    break
+                } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+                    $lastReadErr = $_
+                    if ($attempt -lt 7) {
+                        [System.Threading.Thread]::Sleep(15)
+                    }
+                }
+            }
+            if (-not $readOk) {
+                throw $lastReadErr
+            }
+            __ghostty_trim_transient_errors $errHead
+            $infoAfter = [System.IO.FileInfo]::new($path)
+            if ($infoAfter.Exists) {
+                $ticks = $infoAfter.LastWriteTimeUtc.Ticks
+                $length = $infoAfter.Length
+            }
             if (-not [string]::IsNullOrWhiteSpace($raw)) {
                 $parsed = $raw | ConvertFrom-Json
-                if ($null -ne $parsed) {
-                    $globalProp = $parsed.PSObject.Properties['global']
-                    if ($null -ne $globalProp -and $null -ne $globalProp.Value) {
-                        foreach ($entry in $globalProp.Value.PSObject.Properties) {
-                            $globalMap[$entry.Name] = [string]$entry.Value
-                        }
+                if ($parsed -isnot [System.Management.Automation.PSCustomObject]) {
+                    throw "Invalid shortcuts store format in '$path': expected a JSON object root."
+                }
+                $globalProp = $parsed.PSObject.Properties['global']
+                if ($null -ne $globalProp -and $null -ne $globalProp.Value) {
+                    foreach ($entry in $globalProp.Value.PSObject.Properties) {
+                        $globalMap.set_Item($entry.Name, [string]$entry.Value)
                     }
-                    $projectsProp = $parsed.PSObject.Properties['projects']
-                    if ($null -ne $projectsProp -and $null -ne $projectsProp.Value) {
-                        foreach ($projEntry in $projectsProp.Value.PSObject.Properties) {
-                            $projKey = __ghostty_normalize_project_root $projEntry.Name
-                            if (-not [string]::IsNullOrEmpty($projKey) -and $null -ne $projEntry.Value) {
-                                $projCmds = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
-                                foreach ($cmdEntry in $projEntry.Value.PSObject.Properties) {
-                                    $projCmds[$cmdEntry.Name] = [string]$cmdEntry.Value
-                                }
-                                $projectsMap[$projKey] = $projCmds
+                }
+                $projectsProp = $parsed.PSObject.Properties['projects']
+                if ($null -ne $projectsProp -and $null -ne $projectsProp.Value) {
+                    foreach ($projEntry in $projectsProp.Value.PSObject.Properties) {
+                        $projKey = __ghostty_normalize_project_root $projEntry.Name
+                        if (-not [string]::IsNullOrEmpty($projKey) -and $null -ne $projEntry.Value) {
+                            $projCmds = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+                            foreach ($cmdEntry in $projEntry.Value.PSObject.Properties) {
+                                $projCmds.set_Item($cmdEntry.Name, [string]$cmdEntry.Value)
                             }
+                            $projectsMap.set_Item($projKey, $projCmds)
                         }
                     }
                 }
@@ -1231,7 +1307,9 @@ function global:__ghostty_load_shortcuts {
         Global = $globalMap
         Projects = $projectsMap
     }
-    $Global:__ghostty_shortcut_cache = $loaded
+    if (-not $BypassCache) {
+        $Global:__ghostty_shortcut_cache = $loaded
+    }
     return $loaded
 }
 
@@ -1251,22 +1329,46 @@ function global:__ghostty_save_shortcuts {
     $tmpName = '.' + [System.IO.Path]::GetFileName($path) + '.' + [guid]::NewGuid().ToString('n') + '.tmp'
     $tmpPath = if ([string]::IsNullOrEmpty($dir)) { $tmpName } else { [System.IO.Path]::Combine($dir, $tmpName) }
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    [System.IO.File]::WriteAllText($tmpPath, $json, $utf8NoBom)
+    $bytes = $utf8NoBom.GetBytes($json)
     try {
-        if ([System.IO.File]::Exists($path)) {
-            [System.IO.File]::Replace($tmpPath, $path, $null)
-        } else {
-            [System.IO.File]::Move($tmpPath, $path)
-        }
-    } catch {
+        $fs = [System.IO.FileStream]::new(
+            $tmpPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
         try {
-            [System.IO.File]::Copy($tmpPath, $path, $true)
-            [System.IO.File]::Delete($tmpPath)
-        } catch {
-            if ([System.IO.File]::Exists($tmpPath)) {
-                try { [System.IO.File]::Delete($tmpPath) } catch {}
+            $fs.Write($bytes, 0, $bytes.Length)
+            $fs.Flush($true)
+        } finally {
+            $fs.Dispose()
+        }
+        $committed = $false
+        $lastCommitErr = $null
+        $errHead = __ghostty_error_head
+        for ($attempt = 0; $attempt -lt 8; $attempt++) {
+            try {
+                if ([System.IO.File]::Exists($path)) {
+                    [System.IO.File]::Replace($tmpPath, $path, [NullString]::Value, $true)
+                } else {
+                    [System.IO.File]::Move($tmpPath, $path)
+                }
+                $committed = $true
+                break
+            } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+                $lastCommitErr = $_
+                if ($attempt -lt 7) {
+                    [System.Threading.Thread]::Sleep(15)
+                }
             }
-            throw
+        }
+        if (-not $committed) {
+            throw $lastCommitErr
+        }
+        __ghostty_trim_transient_errors $errHead
+    } finally {
+        if ([System.IO.File]::Exists($tmpPath)) {
+            try { [System.IO.File]::Delete($tmpPath) } catch {}
         }
     }
     $info = [System.IO.FileInfo]::new($path)
@@ -1274,6 +1376,51 @@ function global:__ghostty_save_shortcuts {
     $Data.Ticks = $info.LastWriteTimeUtc.Ticks
     $Data.Length = $info.Length
     $Global:__ghostty_shortcut_cache = $Data
+}
+
+function global:__ghostty_mutate_shortcuts {
+    param(
+        [Parameter(Mandatory)]
+        [scriptblock]$Mutation,
+        [int]$LockTimeoutMs = 5000
+    )
+    $path = __ghostty_shortcuts_path
+    $dir = [System.IO.Path]::GetDirectoryName($path)
+    if (-not [string]::IsNullOrEmpty($dir) -and -not [System.IO.Directory]::Exists($dir)) {
+        [void][System.IO.Directory]::CreateDirectory($dir)
+    }
+    $lockPath = $path + '.lock'
+    $lockStream = $null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $errHead = __ghostty_error_head
+    while ($true) {
+        try {
+            $lockStream = [System.IO.FileStream]::new(
+                $lockPath,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+            break
+        } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+            if ($sw.ElapsedMilliseconds -ge $LockTimeoutMs) {
+                throw "Timed out after ${LockTimeoutMs}ms waiting for shortcut store lock '$lockPath': $($_.Exception.Message)"
+            }
+            [System.Threading.Thread]::Sleep(15)
+        }
+    }
+    __ghostty_trim_transient_errors $errHead
+    try {
+        $data = __ghostty_load_shortcuts -BypassCache
+        $shouldCommit = & $Mutation $data
+        if ($shouldCommit) {
+            __ghostty_save_shortcuts $data
+        }
+    } finally {
+        if ($null -ne $lockStream) {
+            $lockStream.Dispose()
+        }
+    }
 }
 
 function global:__ghostty_escape_single_quote {
@@ -1341,18 +1488,18 @@ function global:__ghostty_shortcut_lookup {
         $matched = $null
         try {
             $data = __ghostty_load_shortcuts -IgnoreReadError
-            if ($null -ne $data -and ($data.Projects.Count -gt 0 -or $data.Global.Count -gt 0)) {
-                if ($data.Projects.Count -gt 0) {
+            if ($null -ne $data -and ($data.Projects.get_Count() -gt 0 -or $data.Global.get_Count() -gt 0)) {
+                if ($data.Projects.get_Count() -gt 0) {
                     $projectRoot = __ghostty_find_git_root
                     if ($null -ne $projectRoot -and $data.Projects.ContainsKey($projectRoot)) {
-                        $projMap = $data.Projects[$projectRoot]
+                        $projMap = $data.Projects.get_Item($projectRoot)
                         if ($projMap.ContainsKey($name)) {
-                            $matched = $projMap[$name]
+                            $matched = $projMap.get_Item($name)
                         }
                     }
                 }
                 if ($null -eq $matched -and $data.Global.ContainsKey($name)) {
-                    $matched = $data.Global[$name]
+                    $matched = $data.Global.get_Item($name)
                 }
             }
         } catch {
@@ -1506,17 +1653,22 @@ if (__ghostty_shortcut_cli_exists) {
                 }
                 Write-Warning "Shortcut '$name' collides with existing $kind '$($existing.Name)'; PowerShell will still resolve the existing command first." -WarningAction Continue
             }
-            $data = __ghostty_load_shortcuts
             if ($useProject) {
-                if (-not $data.Projects.ContainsKey($projectRoot)) {
-                    $data.Projects[$projectRoot] = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+                __ghostty_mutate_shortcuts {
+                    param($d)
+                    if (-not $d.Projects.ContainsKey($projectRoot)) {
+                        $d.Projects.set_Item($projectRoot, [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase))
+                    }
+                    $d.Projects.get_Item($projectRoot).set_Item($name, $cmd)
+                    return $true
                 }
-                $data.Projects[$projectRoot][$name] = $cmd
-                __ghostty_save_shortcuts $data
                 Write-Output "Saved project shortcut '$name' -> $cmd ($projectRoot)"
             } else {
-                $data.Global[$name] = $cmd
-                __ghostty_save_shortcuts $data
+                __ghostty_mutate_shortcuts {
+                    param($d)
+                    $d.Global.set_Item($name, $cmd)
+                    return $true
+                }
                 Write-Output "Saved global shortcut '$name' -> $cmd"
             }
             return
@@ -1542,20 +1694,20 @@ if (__ghostty_shortcut_cli_exists) {
             }
             $data = __ghostty_load_shortcuts
             if ($useProject) {
-                if (-not $data.Projects.ContainsKey($projectRoot) -or $data.Projects[$projectRoot].Count -eq 0) {
+                if (-not $data.Projects.ContainsKey($projectRoot) -or $data.Projects.get_Item($projectRoot).get_Count() -eq 0) {
                     Write-Output "No project shortcuts for $projectRoot."
                     return
                 }
-                $map = $data.Projects[$projectRoot]
+                $map = $data.Projects.get_Item($projectRoot)
             } else {
-                if ($data.Global.Count -eq 0) {
+                if ($data.Global.get_Count() -eq 0) {
                     Write-Output 'No global shortcuts.'
                     return
                 }
                 $map = $data.Global
             }
-            foreach ($k in ($map.Keys | Sort-Object)) {
-                Write-Output "$k -> $($map[$k])"
+            foreach ($k in ($map.get_Keys() | Sort-Object)) {
+                Write-Output "$k -> $($map.get_Item($k))"
             }
             return
         }
@@ -1593,25 +1745,40 @@ if (__ghostty_shortcut_cli_exists) {
                     return
                 }
             }
-            $data = __ghostty_load_shortcuts
+            $txState = @{ notFound = $false }
             if ($useProject) {
-                if (-not $data.Projects.ContainsKey($projectRoot) -or -not $data.Projects[$projectRoot].ContainsKey($name)) {
+                __ghostty_mutate_shortcuts {
+                    param($d)
+                    if (-not $d.Projects.ContainsKey($projectRoot) -or -not $d.Projects.get_Item($projectRoot).ContainsKey($name)) {
+                        $txState.notFound = $true
+                        return $false
+                    }
+                    $projMap = $d.Projects.get_Item($projectRoot)
+                    $projMap.Remove($name)
+                    if ($projMap.get_Count() -eq 0) {
+                        $d.Projects.Remove($projectRoot)
+                    }
+                    return $true
+                }
+                if ($txState.notFound) {
                     Write-Error "Shortcut '$name' not found in project '$projectRoot'."
                     return
                 }
-                $data.Projects[$projectRoot].Remove($name)
-                if ($data.Projects[$projectRoot].Count -eq 0) {
-                    $data.Projects.Remove($projectRoot)
-                }
-                __ghostty_save_shortcuts $data
                 Write-Output "Removed project shortcut '$name' ($projectRoot)."
             } else {
-                if (-not $data.Global.ContainsKey($name)) {
+                __ghostty_mutate_shortcuts {
+                    param($d)
+                    if (-not $d.Global.ContainsKey($name)) {
+                        $txState.notFound = $true
+                        return $false
+                    }
+                    $d.Global.Remove($name)
+                    return $true
+                }
+                if ($txState.notFound) {
                     Write-Error "Shortcut '$name' not found in global shortcuts."
                     return
                 }
-                $data.Global.Remove($name)
-                __ghostty_save_shortcuts $data
                 Write-Output "Removed global shortcut '$name'."
             }
             return
