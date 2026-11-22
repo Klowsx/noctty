@@ -396,6 +396,37 @@ connection. On Windows PowerShell that path is not portable enough to run
 silently, so uncached hosts remain on `xterm-256color` until the terminfo is
 installed by another shell integration path or manually added to the SSH cache.
 
+#### Persistent command shortcuts
+
+The PowerShell integration includes a persistent command shortcuts prototype:
+
+- **CLI usage**: `shortcut add [--project|-p] [--force|-f] <name> <command>`,
+  `shortcut list [--project|-p]`, `shortcut remove [--project|-p] <name>`, and
+  `shortcut help` (`--help` / `-h`). Names cannot be empty, contain whitespace
+  or PowerShell metacharacters, or be `shortcut`. If a user profile already
+  owns `shortcut` as a function or alias, Noctty emits a warning and leaves it
+  untouched.
+- **Scope & precedence**: Global shortcuts apply everywhere; `--project`
+  (`-p`) shortcuts are keyed by the Git working-tree root (matching the root
+  and its subdirectories via a `.git` directory or `.git` worktree/submodule
+  file, and erroring outside a Git working tree). Project shortcuts override
+  global shortcuts dynamically as you `cd`.
+- **Execution & quoting**: Shortcuts execute in the current PowerShell session
+  and directory, preserve internal quotes verbatim, forward extra arguments,
+  preserve `$LASTEXITCODE` (for native commands and OSC 133 D), record
+  non-terminating `Write-Error`s in `$Error`, propagate terminating errors
+  (`throw`, setting `$?` to `$false`), and guard against recursion (max depth 8).
+- **Collision rule**: PowerShell resolves its own commands, functions, aliases,
+  cmdlets, and `PATH` applications first. `shortcut add` blocks colliding names
+  unless `--force` (`-f`) is passed, which warns and saves anyway.
+- **Storage & performance**: Shortcuts are stored in `shortcuts.json`, resolved
+  in order from `NOCTTY_SHORTCUTS_PATH`, `$env:XDG_CONFIG_HOME\noctty\shortcuts.json`,
+  `shortcuts.json` beside `noctty.portable`, or `%LOCALAPPDATA%\noctty\shortcuts.json`.
+  The store is lazy-loaded with zero startup I/O, cached by path, mtime, and
+  size, and written atomically. Resolution hooks `CommandNotFoundAction` (in
+  `FullLanguage` mode, chaining any existing handler) with no keystroke
+  interception, no per-prompt Git lookup, and no polling.
+
 Interactive `cmd.exe` launches are auto-integrated by wrapping the inherited
 `PROMPT` (or cmd's `$P$G` default) with OSC 133 A/B prompt marks and OSC 9;9 cwd
 reports. When the shipped cmd Lua script is present, noctty prepends its directory
